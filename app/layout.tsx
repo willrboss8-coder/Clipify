@@ -2,9 +2,9 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "ViralClips MVP",
+  title: "Clipify",
   description:
-    "Upload a long video, automatically generate short vertical clips optimized for TikTok, Reels, and Shorts.",
+    "Turn long videos into shareable clips optimized for TikTok, Reels, and Shorts.",
 };
 
 export default function RootLayout({

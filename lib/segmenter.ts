@@ -35,13 +35,127 @@ const STRONG_PATTERNS = [
   { pattern: /\bhack\b|\btip\b|\btrick\b|\bstrategy\b/gi, weight: 3 },
 ];
 
-function scoreText(text: string): number {
+const INTRO_PATTERNS: RegExp[] = [
+  /\bwelcome back\b/i,
+  /\bwelcome to the (podcast|show|channel|stream)\b/i,
+  /\bin today'?s episode\b/i,
+  /\btoday we'?re (talking|going to talk|gonna talk|discussing)\b/i,
+  /\bbefore we (get started|begin|dive in|jump in)\b/i,
+  /\blet'?s get into it\b/i,
+  /\bthanks for tuning in\b/i,
+  /\bif you'?re new here\b/i,
+  /\bwhat'?s (up|going on) (everybody|everyone|guys)\b/i,
+  /\bhey (everybody|everyone|guys)\b/i,
+  /\bwhat is up\b/i,
+];
+
+const OUTRO_PATTERNS: RegExp[] = [
+  /\bthanks for (watching|listening|viewing)\b/i,
+  /\bsee you (next time|in the next|later)\b/i,
+  /\bsee you in the next one\b/i,
+  /\blike and subscribe\b/i,
+  /\b(hit|smash) (the )?(like|subscribe|bell|notification)\b/i,
+  /\bsubscribe\b/i,
+  /\bfollow for more\b/i,
+  /\bcheck the link (below|in the description)\b/i,
+  /\bthat'?s it for today\b/i,
+  /\bcatch you next time\b/i,
+  /\bpeace out\b/i,
+  /\bgoodbye\b/i,
+  /\btake care\b/i,
+  /\buntil next time\b/i,
+  /\bwrap(ping)? (it )?up\b/i,
+];
+
+const AD_PROMO_PATTERNS: RegExp[] = [
+  /\b(this|today'?s) (episode|video|show) is (sponsored|brought to you) by\b/i,
+  /\bsponsored by\b/i,
+  /\bsponsor\b/i,
+  /\btoday'?s sponsor\b/i,
+  /\ba quick word from our sponsor\b/i,
+  /\bad break\b/i,
+  /\buse (my |the )?code\b/i,
+  /\bpromo code\b/i,
+  /\blink in (bio|the description|my bio)\b/i,
+  /\blink below\b/i,
+  /\bsign up now\b/i,
+  /\bfree trial\b/i,
+  /\bdownload now\b/i,
+  /\bcheck (it )?out\b/i,
+  /\bbrought to you by\b/i,
+  /\bdiscount code\b/i,
+  /\bgo to .+\.com\b/i,
+  /\baffiliate\b/i,
+];
+
+interface ContentPenalty {
+  penalty: number;
+  reasons: string[];
+}
+
+function classifyContent(
+  text: string,
+  startSec: number,
+  endSec: number,
+  duration: number,
+  isViral: boolean
+): ContentPenalty {
+  const reasons: string[] = [];
+  let penalty = 0;
+  const lower = text.toLowerCase();
+
+  for (const pat of INTRO_PATTERNS) {
+    if (pat.test(lower)) {
+      penalty += 50;
+      reasons.push("intro");
+      break;
+    }
+  }
+
+  for (const pat of OUTRO_PATTERNS) {
+    if (pat.test(lower)) {
+      penalty += 50;
+      reasons.push("outro");
+      break;
+    }
+  }
+
+  let adHits = 0;
+  for (const pat of AD_PROMO_PATTERNS) {
+    if (pat.test(lower)) adHits++;
+  }
+  if (adHits > 0) {
+    penalty += 30 + adHits * 15;
+    reasons.push("ad/promo");
+  }
+
+  const introZone = Math.min(duration * 0.1, 90);
+  const outroZone = Math.min(duration * 0.1, 90);
+  const viralMultiplier = isViral ? 1.5 : 1;
+
+  if (startSec < introZone) {
+    const proximity = 1 - startSec / introZone;
+    const posPenalty = proximity * 20 * viralMultiplier;
+    penalty += posPenalty;
+    if (posPenalty > 5) reasons.push("near-start");
+  }
+
+  if (endSec > duration - outroZone) {
+    const proximity = 1 - (duration - endSec) / outroZone;
+    const posPenalty = proximity * 20 * viralMultiplier;
+    penalty += posPenalty;
+    if (posPenalty > 5) reasons.push("near-end");
+  }
+
+  return { penalty, reasons };
+}
+
+export function scoreText(text: string): number {
   let score = 0;
   for (const { pattern, weight } of STRONG_PATTERNS) {
     const matches = text.match(pattern);
     if (matches) score += matches.length * weight;
   }
-  // Bonus for sentence length (medium sentences work best)
   const words = text.split(/\s+/).length;
   if (words > 10 && words < 60) score += 2;
   return score;
@@ -65,30 +179,21 @@ function overlaps(a: ClipCandidate, b: ClipCandidate): boolean {
 }
 
 export function getPreset(
-  platform: string,
+  _platform: string,
   goal: string
 ): Preset {
-  const isReels = platform === "reels";
-
   if (goal === "viral") {
     return {
-      minLen: isReels ? 15 : 15,
-      maxLen: isReels ? 20 : 25,
-      count: 8,
+      minLen: 20,
+      maxLen: 30,
+      count: 5,
     };
   }
-  if (goal === "monetize") {
-    return {
-      minLen: isReels ? 50 : 60,
-      maxLen: isReels ? 75 : 90,
-      count: 3,
-    };
-  }
-  // default: grow / promote
+  // monetize (or default/unknown)
   return {
-    minLen: isReels ? 25 : 30,
-    maxLen: isReels ? 35 : 45,
-    count: 5,
+    minLen: 60,
+    maxLen: 90,
+    count: 3,
   };
 }
 
@@ -99,16 +204,16 @@ export function findBestMoments(
   const { duration, segments } = transcript;
   if (segments.length === 0) return [];
 
-  const skipStart = 45;
-  const skipEnd = Math.max(0, duration - 45);
+  const isViral = preset.maxLen <= 30;
 
-  // Filter segments within valid range
+  const hardSkipStart = 15;
+  const hardSkipEnd = Math.max(0, duration - 15);
+
   const valid = segments.filter(
-    (s) => s.start >= skipStart && s.end <= skipEnd
+    (s) => s.start >= hardSkipStart && s.end <= hardSkipEnd
   );
   if (valid.length === 0) return [];
 
-  // Build candidate windows
   const candidates: ClipCandidate[] = [];
 
   for (let i = 0; i < valid.length; i++) {
@@ -129,23 +234,36 @@ export function findBestMoments(
     const fullText = windowSegs.map((s) => s.text).join(" ");
     const rawScore = scoreText(fullText);
 
-    // Prefer clips closer to ideal length
     const idealLen = (preset.minLen + preset.maxLen) / 2;
     const lenPenalty = Math.abs(windowLen - idealLen) * 0.1;
+
+    const { penalty: contentPenalty, reasons } = classifyContent(
+      fullText,
+      valid[i].start,
+      windowEnd,
+      duration,
+      isViral
+    );
+
+    if (reasons.length > 0) {
+      console.log(
+        `[Clip Filter] Penalized candidate ${valid[i].start.toFixed(1)}s-${windowEnd.toFixed(1)}s: ${reasons.join(", ")} (penalty=${contentPenalty.toFixed(1)}, rawScore=${rawScore})`
+      );
+    }
+
+    const finalScore = Math.max(0, rawScore - lenPenalty - contentPenalty);
 
     candidates.push({
       startSec: valid[i].start,
       endSec: windowEnd,
       hook: pickHook(windowSegs),
-      confidence: Math.max(0, rawScore - lenPenalty),
+      confidence: finalScore,
       segments: [...windowSegs],
     });
   }
 
-  // Sort by confidence descending
   candidates.sort((a, b) => b.confidence - a.confidence);
 
-  // Pick top N non-overlapping
   const selected: ClipCandidate[] = [];
   for (const c of candidates) {
     if (selected.length >= preset.count) break;
@@ -153,13 +271,11 @@ export function findBestMoments(
     selected.push(c);
   }
 
-  // Normalize confidence to 0-100
   const maxConf = Math.max(...selected.map((c) => c.confidence), 1);
   for (const c of selected) {
     c.confidence = Math.round((c.confidence / maxConf) * 100);
   }
 
-  // Sort by start time for output
   selected.sort((a, b) => a.startSec - b.startSec);
 
   return selected;

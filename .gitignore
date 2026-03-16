@@ -4,3 +4,4 @@ out
 storage/
 .DS_Store
 *.local
+.env.local
