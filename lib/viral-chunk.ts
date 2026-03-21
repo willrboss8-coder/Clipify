@@ -1,35 +1,59 @@
 import type { TranscriptSegment } from "./segmenter";
 
-/**
- * Tighter cap = faster pacing after renormalization to the SRT line window.
- */
-const MAX_CHUNK_SECONDS = 0.32;
+const MAX_WORDS_PER_CHUNK = 3;
+
+/** Hard max characters per viral caption line (one line only). */
+export const VIRAL_CAPTION_MAX_CHARS = 18;
+
+/** Per-chunk dwell cap — lower = snappier, then renormalized to the subtitle line window. */
+const MAX_CHUNK_SECONDS = 0.24;
+
+export function lineFitsViralCharLimit(joined: string): boolean {
+  return joined.length <= VIRAL_CAPTION_MAX_CHARS;
+}
 
 /**
- * Split words into chunks of at most 2 words (avoids lone 1-word tails when possible).
+ * Split a phrase into one or more lines of at most VIRAL_CAPTION_MAX_CHARS (long single words).
  */
-export function chunkWordsIntoPhrases(words: string[]): string[][] {
+export function splitLongPhraseIntoViralLines(phrase: string): string[] {
+  const p = phrase.trim();
+  if (p.length === 0) return [];
+  if (p.length <= VIRAL_CAPTION_MAX_CHARS) return [p];
+  const lines: string[] = [];
+  let i = 0;
+  while (i < p.length) {
+    lines.push(p.slice(i, i + VIRAL_CAPTION_MAX_CHARS));
+    i += VIRAL_CAPTION_MAX_CHARS;
+  }
+  return lines;
+}
+
+/**
+ * Up to 3 words if the joined line is ≤18 characters; else 2; else 1 (may exceed 18 until split).
+ */
+export function chunkWordsIntoPhrases(words: string[]): string[] {
   const n = words.length;
   if (n === 0) return [];
-  const chunks: string[][] = [];
+  const phrases: string[] = [];
   let i = 0;
   while (i < n) {
     const rem = n - i;
-    let take: number;
-    if (rem <= 2) {
-      take = rem;
-    } else if (rem === 3) {
-      take = 2;
-    } else {
-      take = 2;
+    let take = Math.min(MAX_WORDS_PER_CHUNK, rem);
+    while (take >= 1) {
+      const slice = words.slice(i, i + take);
+      const joined = slice.join(" ");
+      if (lineFitsViralCharLimit(joined) || take === 1) {
+        phrases.push(joined);
+        i += take;
+        break;
+      }
+      take--;
     }
-    chunks.push(words.slice(i, i + take));
-    i += take;
   }
-  return chunks;
+  return phrases;
 }
 
-function enforceNoOverlapStacking(events: TranscriptSegment[]): TranscriptSegment[] {
+export function enforceNoOverlapStacking(events: TranscriptSegment[]): TranscriptSegment[] {
   if (events.length <= 1) return events;
   const out = [...events];
   for (let i = 1; i < out.length; i++) {
@@ -46,8 +70,9 @@ function enforceNoOverlapStacking(events: TranscriptSegment[]): TranscriptSegmen
 }
 
 /**
- * Short phrase chunks + proportional timing with a tight per-chunk cap (renormalized).
- * Overlapping times would stack multiple ASS lines — we enforce strict sequencing.
+ * Character-weighted timing within each SRT line (longer phrases get more time, closer to speech rhythm),
+ * then per-chunk cap + scale so chunks turn over quickly without drifting past the line end.
+ * Phrases are split to ≤18 chars per segment; timing is redistributed across those sub-lines.
  */
 export function expandSegmentsForViralCaptions(
   segments: TranscriptSegment[]
@@ -59,23 +84,24 @@ export function expandSegmentsForViralCaptions(
     if (words.length === 0) continue;
 
     const dur = Math.max(0.001, seg.end - seg.start);
-    let chunks = chunkWordsIntoPhrases(words);
-    if (chunks.length === 1 && chunks[0]!.length >= 2) {
-      chunks = chunks[0]!.map((w) => [w]);
-    }
-    const totalWords = words.length;
-    let cumWords = 0;
+    const phrases = chunkWordsIntoPhrases(words);
+    const lineText = words.join(" ");
+    const totalChars = Math.max(1, lineText.length);
 
     const proportionalDurs: number[] = [];
     const texts: string[] = [];
 
-    for (const chunk of chunks) {
-      const w0 = cumWords;
-      cumWords += chunk.length;
-      const t0 = seg.start + dur * (w0 / totalWords);
-      const t1 = seg.start + dur * (cumWords / totalWords);
+    let charPos = 0;
+    for (let ci = 0; ci < phrases.length; ci++) {
+      const phrase = phrases[ci]!;
+      const startChars = charPos;
+      charPos += phrase.length;
+      if (ci < phrases.length - 1) charPos += 1;
+
+      const t0 = seg.start + dur * (startChars / totalChars);
+      const t1 = seg.start + dur * (charPos / totalChars);
       proportionalDurs.push(t1 - t0);
-      texts.push(chunk.join(" "));
+      texts.push(phrase);
     }
 
     let durs = proportionalDurs.map((d) => Math.min(d, MAX_CHUNK_SECONDS));
@@ -86,13 +112,24 @@ export function expandSegmentsForViralCaptions(
     }
 
     let t = seg.start;
-    for (let i = 0; i < chunks.length; i++) {
-      const end = i === chunks.length - 1 ? seg.end : t + durs[i]!;
-      out.push({
-        start: t,
-        end: end,
-        text: texts[i]!,
-      });
+    for (let i = 0; i < phrases.length; i++) {
+      const end = i === phrases.length - 1 ? seg.end : t + durs[i]!;
+      const phrase = texts[i]!;
+      const phraseDur = Math.max(0.001, end - t);
+      const viralLines = splitLongPhraseIntoViralLines(phrase);
+      const denom = Math.max(1, phrase.length);
+      let pt = t;
+      for (let li = 0; li < viralLines.length; li++) {
+        const line = viralLines[li]!;
+        const lineDur = phraseDur * (line.length / denom);
+        const lineEnd = li === viralLines.length - 1 ? end : pt + lineDur;
+        out.push({
+          start: pt,
+          end: lineEnd,
+          text: line,
+        });
+        pt = lineEnd;
+      }
       t = end;
     }
   }

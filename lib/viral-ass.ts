@@ -1,4 +1,5 @@
 import type { TranscriptSegment } from "./segmenter";
+import { viralAssMarginLRPx } from "./viral-width";
 
 /** Escape plain text for ASS Dialogue lines (avoid accidental override tags) */
 function escapeAssText(text: string): string {
@@ -21,10 +22,11 @@ function secondsToAssTime(seconds: number): string {
 }
 
 /**
- * Single viral style: small one-line captions, strong outline/shadow, bottom third.
- * {\q2} = no wrapping (no multi-line stacking from one event); Alignment 2 = bottom center.
+ * Single viral style: max one row per event (\\q2), bottom-centered (\\an2), Arial 18, outline/shadow.
+ * Line length is enforced in `lib/viral-chunk.ts` (max 18 chars). MarginL/R match visible content column.
  */
 export function buildViralAss(segments: TranscriptSegment[]): string {
+  const m = viralAssMarginLRPx();
   const header = `[Script Info]
 Title: Clipify Viral
 ScriptType: v4.00+
@@ -33,7 +35,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Viral,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,90,90,0,0,1,3,2,2,40,40,60,1
+Style: Viral,Arial,18,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,2,2,${m},${m},58,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text

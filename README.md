@@ -12,12 +12,22 @@ pip install faster-whisper
 ## Setup
 
 ```bash
-cd src/data/ClipFArm
 npm install
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
+
+### Premium viral captions (optional word-level timing)
+
+By default, viral caption **timing** uses the existing local **SRT** from the job. For **better sync**, set:
+
+| Variable | Purpose |
+|----------|---------|
+| `OPENAI_API_KEY` | Enables **OpenAI Whisper** word-level timestamps on the clip audio (extra API cost per burn). |
+| `VIRAL_CAPTION_TIMING_PROVIDER` | `auto` (default): use OpenAI when the key is set, else SRT. `openai`: require OpenAI (falls back to SRT on failure). `local`: always SRT. |
+
+No extra npm packages are required (`fetch` only). Multi-speaker labels are **not** returned by Whisper; `TimedWord.speaker` is reserved for a future diarized provider.
 
 ## How It Works
 

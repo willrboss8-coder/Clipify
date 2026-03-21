@@ -2,11 +2,10 @@ import { auth } from "@clerk/nextjs/server";
 import { clerkClient } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
 import path from "path";
-import { readFile, writeFile, stat } from "fs/promises";
+import { writeFile, stat } from "fs/promises";
 import { burnViralCaptions } from "@/lib/ffmpeg";
-import { parseSrt } from "@/lib/srt";
-import { expandSegmentsForViralCaptions } from "@/lib/viral-chunk";
 import { buildViralAss } from "@/lib/viral-ass";
+import { resolveViralCaptionSegments } from "@/lib/viral-timing/resolve";
 import { normalizePlan } from "@/lib/plans";
 import {
   getViralCaptionAccess,
@@ -147,16 +146,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const srtContent = await readFile(srtPath, "utf-8");
-    const segments = parseSrt(srtContent);
-    if (segments.length === 0) {
+    const { segments: viralSegments, source: timingSource } =
+      await resolveViralCaptionSegments(videoPath, srtPath);
+    if (viralSegments.length === 0) {
       return NextResponse.json(
-        { error: "No caption lines found for this clip (missing .srt?)" },
+        {
+          error:
+            "No caption timing available for this clip (missing .srt or transcription failed).",
+        },
         { status: 400 }
       );
     }
 
-    const viralSegments = expandSegmentsForViralCaptions(segments);
     const assContent = buildViralAss(viralSegments);
     await writeFile(assPath, assContent, "utf-8");
 
@@ -190,6 +191,7 @@ export async function POST(req: NextRequest) {
       clipUrl: `/api/files/outputs/${jobId}/${outputName}?v=${version}`,
       viralApplied: true,
       accessAfter: nextAccess,
+      timingSource,
     });
   } catch (err) {
     console.error("[viral-captions POST]", err);
