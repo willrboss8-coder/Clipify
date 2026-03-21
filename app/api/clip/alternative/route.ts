@@ -45,7 +45,7 @@ export async function POST(req: NextRequest) {
     const jobId = body.jobId;
     const clipIndex = body.clipIndex;
     const platform = body.platform || "tiktok";
-    const goal = body.goal || "viral";
+    const goal = body.goal || "growth";
     const currentStartSec = body.currentStartSec ?? 0;
     const currentEndSec = body.currentEndSec ?? 0;
     const allClipRanges: ClipRange[] = Array.isArray(body.allClipRanges) ? body.allClipRanges : [];

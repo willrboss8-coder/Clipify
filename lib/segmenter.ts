@@ -98,7 +98,8 @@ function classifyContent(
   startSec: number,
   endSec: number,
   duration: number,
-  isViral: boolean
+  /** Stronger intro/outro penalties for very short clip presets (≤30s max); disabled for Growth (30–45) and Monetize */
+  aggressiveEdgePenalties: boolean
 ): ContentPenalty {
   const reasons: string[] = [];
   let penalty = 0;
@@ -131,18 +132,18 @@ function classifyContent(
 
   const introZone = Math.min(duration * 0.1, 90);
   const outroZone = Math.min(duration * 0.1, 90);
-  const viralMultiplier = isViral ? 1.5 : 1;
+  const edgeMultiplier = aggressiveEdgePenalties ? 1.5 : 1;
 
   if (startSec < introZone) {
     const proximity = 1 - startSec / introZone;
-    const posPenalty = proximity * 20 * viralMultiplier;
+    const posPenalty = proximity * 20 * edgeMultiplier;
     penalty += posPenalty;
     if (posPenalty > 5) reasons.push("near-start");
   }
 
   if (endSec > duration - outroZone) {
     const proximity = 1 - (duration - endSec) / outroZone;
-    const posPenalty = proximity * 20 * viralMultiplier;
+    const posPenalty = proximity * 20 * edgeMultiplier;
     penalty += posPenalty;
     if (posPenalty > 5) reasons.push("near-end");
   }
@@ -178,14 +179,18 @@ function overlaps(a: ClipCandidate, b: ClipCandidate): boolean {
   return a.startSec < b.endSec && b.startSec < a.endSec;
 }
 
-export function getPreset(
-  _platform: string,
-  goal: string
-): Preset {
-  if (goal === "viral") {
+/** Normalize legacy clients that still send goal=viral */
+function normalizeGoal(goal: string): string {
+  if (goal === "viral") return "growth";
+  return goal;
+}
+
+export function getPreset(_platform: string, goal: string): Preset {
+  const g = normalizeGoal(goal);
+  if (g === "growth") {
     return {
-      minLen: 20,
-      maxLen: 30,
+      minLen: 30,
+      maxLen: 45,
       count: 5,
     };
   }
@@ -204,7 +209,8 @@ export function findBestMoments(
   const { duration, segments } = transcript;
   if (segments.length === 0) return [];
 
-  const isViral = preset.maxLen <= 30;
+  // Only legacy/very-short presets (maxLen ≤30) used stronger edge penalties; Growth is 30–45 so this stays off
+  const aggressiveEdgePenalties = preset.maxLen <= 30;
 
   const hardSkipStart = 15;
   const hardSkipEnd = Math.max(0, duration - 15);
@@ -242,7 +248,7 @@ export function findBestMoments(
       valid[i].start,
       windowEnd,
       duration,
-      isViral
+      aggressiveEdgePenalties
     );
 
     if (reasons.length > 0) {

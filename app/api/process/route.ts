@@ -3,9 +3,11 @@ import { copyFile, mkdir, writeFile, readFile } from "fs/promises";
 import path from "path";
 import { v4 as uuid } from "uuid";
 import { spawn } from "child_process";
-import { extractAudio, cutClip } from "@/lib/ffmpeg";
+import { auth } from "@clerk/nextjs/server";
+import { extractAudio, cutClip, getVideoDuration } from "@/lib/ffmpeg";
 import { findBestMoments, getPreset, type Transcript } from "@/lib/segmenter";
 import { writeSrt } from "@/lib/srt";
+import { canUserProcess, recordUsage } from "@/lib/usage";
 
 export const runtime = "nodejs";
 
@@ -34,11 +36,15 @@ function runPython(
 
 export async function POST(req: NextRequest) {
   try {
+    const { userId } = await auth();
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
     const platform = (formData.get("platform") as string) || "tiktok";
     const goal = (formData.get("goal") as string) || "default";
-    const plan = (formData.get("plan") as string) || "free";
 
     if (!file) {
       return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
@@ -57,6 +63,22 @@ export async function POST(req: NextRequest) {
     const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
     const buffer = Buffer.from(await file.arrayBuffer());
     await writeFile(videoPath, buffer);
+
+    // 1b. Check video duration against usage limits
+    const durationSec = await getVideoDuration(videoPath);
+    const durationMin = durationSec / 60;
+
+    const usageCheck = await canUserProcess(userId, durationMin);
+    console.log(`[Usage] User plan: ${usageCheck.usage.plan}`);
+    console.log(`[Usage] Remaining minutes before job: ${Math.round(usageCheck.usage.minutesRemaining)}`);
+    console.log(`[Usage] Video duration: ${durationMin.toFixed(1)} min`);
+
+    if (!usageCheck.allowed) {
+      return NextResponse.json(
+        { error: usageCheck.message, usageLimitError: true },
+        { status: 403 }
+      );
+    }
 
     // 2. Extract audio
     const audioPath = path.join(jobDir, "audio.wav");
@@ -114,10 +136,19 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // Record usage after successful processing
+    const updatedUsage = await recordUsage(userId, durationMin);
+    console.log(`[Usage] Remaining minutes after job: ${Math.round(updatedUsage.minutesRemaining)}`);
+
     return NextResponse.json({
       jobId,
       preset,
       clips: results,
+      usage: {
+        minutesUsed: updatedUsage.minutesUsed,
+        minutesLimit: updatedUsage.minutesLimit,
+        minutesRemaining: updatedUsage.minutesRemaining,
+      },
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Unknown error";

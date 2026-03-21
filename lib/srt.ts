@@ -1,6 +1,46 @@
 import { writeFile } from "fs/promises";
 import type { TranscriptSegment } from "./segmenter";
 
+function parseSrtTime(line: string): number {
+  const normalized = line.trim().replace(",", ".");
+  const m = normalized.match(
+    /^(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,3})$/
+  );
+  if (!m) return 0;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const s = parseInt(m[3], 10);
+  const frac = m[4].padEnd(3, "0").slice(0, 3);
+  const ms = parseInt(frac, 10);
+  return h * 3600 + min * 60 + s + ms / 1000;
+}
+
+/** Parse SRT content into segments with times in seconds (same timeline as file) */
+export function parseSrt(content: string): TranscriptSegment[] {
+  const out: TranscriptSegment[] = [];
+  const blocks = content.replace(/\r\n/g, "\n").split(/\n\s*\n/);
+  for (const block of blocks) {
+    const lines = block.trim().split("\n");
+    if (lines.length < 2) continue;
+    let idx = 0;
+    if (/^\d+$/.test(lines[0].trim())) idx = 1;
+    const timeLine = lines[idx];
+    if (!timeLine) continue;
+    const m = timeLine.match(
+      /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/
+    );
+    if (!m) continue;
+    const start = parseSrtTime(m[1]);
+    const end = parseSrtTime(m[2]);
+    const text = lines
+      .slice(idx + 1)
+      .join("\n")
+      .trim();
+    if (text) out.push({ start, end, text });
+  }
+  return out;
+}
+
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);

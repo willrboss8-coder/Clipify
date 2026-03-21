@@ -27,7 +27,7 @@ Open [http://localhost:3000](http://localhost:3000).
 4. The pipeline:
    - Extracts audio from the video
    - Transcribes using faster-whisper (runs locally)
-   - Finds strong/viral moments using text heuristics
+   - Finds strong shareable moments using text heuristics (Growth & Monetize modes)
    - Cuts vertical clips (1080x1920) with burned-in captions
    - Adds watermark on Free plan
 5. Download your clips

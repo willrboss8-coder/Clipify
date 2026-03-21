@@ -46,6 +46,19 @@ export async function extractAudio(
   ]);
 }
 
+export async function getVideoDuration(videoPath: string): Promise<number> {
+  const { stdout } = await run("ffprobe", [
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "csv=p=0",
+    videoPath,
+  ]);
+  return parseFloat(stdout.trim());
+}
+
 export async function getVideoDimensions(
   videoPath: string
 ): Promise<{ width: number; height: number }> {
@@ -105,4 +118,38 @@ export async function cutClip(
     ...ENCODE_ARGS,
     outputPath,
   ]);
+}
+
+/** Re-encode video with libass `ass` filter; requires ffmpeg built with libass */
+const BURN_VIRAL_ENCODE = [
+  "-c:v", "libx264",
+  "-preset", "fast",
+  "-c:a", "copy",
+  "-movflags", "+faststart",
+];
+
+/**
+ * Burn ASS subtitles onto an existing clip. Runs ffmpeg with cwd = clip directory
+ * so paths stay simple for the `ass=` filter.
+ */
+export async function burnViralCaptions(
+  clipVideoPath: string,
+  assPath: string,
+  outputPath: string
+): Promise<void> {
+  const outDir = path.dirname(clipVideoPath);
+  if (path.dirname(assPath) !== outDir || path.dirname(outputPath) !== outDir) {
+    throw new Error(
+      "burnViralCaptions: clip, ass, and output must live in the same directory"
+    );
+  }
+  const clipName = path.basename(clipVideoPath);
+  const assName = path.basename(assPath);
+  const outName = path.basename(outputPath);
+  console.log("[ffmpeg] viral burn:", clipName, "+", assName, "->", outName);
+  await run(
+    "ffmpeg",
+    ["-y", "-i", clipName, "-vf", `ass=${assName}`, ...BURN_VIRAL_ENCODE, outName],
+    outDir
+  );
 }
