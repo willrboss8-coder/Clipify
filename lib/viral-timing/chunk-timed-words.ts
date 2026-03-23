@@ -1,52 +1,56 @@
 import type { TranscriptSegment } from "@/lib/segmenter";
 import {
+  chunkTimedWordsIntoPhrases,
   enforceNoOverlapStacking,
-  lineFitsViralCharLimit,
+  segmentWithOptionalHighlight,
   splitLongPhraseIntoViralLines,
 } from "@/lib/viral-chunk";
+import { cleanTimedWordToken } from "@/lib/viral-text-clean";
 import type { TimedWord } from "./types";
 
-const MAX_WORDS = 3;
-
 /**
- * Build display segments from word-level timestamps: up to 3 words if line ≤18 chars; else 2; else 1.
- * Long single words are split into consecutive ≤18-char lines with proportional timing.
+ * Build display segments from word-level timestamps: same natural 3→2→1 rules as SRT path,
+ * cleaned tokens, one optional highlight per line.
  */
 export function buildSegmentsFromTimedWords(timedWords: TimedWord[]): TranscriptSegment[] {
-  const words = timedWords.filter((w) => w.text.trim().length > 0);
+  const words = timedWords
+    .map((w) => {
+      const cleaned = cleanTimedWordToken(w.text);
+      if (cleaned == null) return null;
+      return {
+        startSec: w.startSec,
+        endSec: w.endSec,
+        text: cleaned,
+      };
+    })
+    .filter((w): w is { startSec: number; endSec: number; text: string } => w != null);
+
   if (words.length === 0) return [];
 
+  const chunks = chunkTimedWordsIntoPhrases(words);
   const out: TranscriptSegment[] = [];
-  let i = 0;
-  while (i < words.length) {
-    const rem = words.length - i;
-    let take = Math.min(MAX_WORDS, rem);
-    while (take >= 1) {
-      const slice = words.slice(i, i + take);
-      const joined = slice.map((w) => w.text.trim()).join(" ");
-      if (lineFitsViralCharLimit(joined) || take === 1) {
-        const start = slice[0]!.startSec;
-        const end = slice[slice.length - 1]!.endSec;
-        const dur = Math.max(0.02, end - start);
-        const viralLines = splitLongPhraseIntoViralLines(joined);
-        const denom = Math.max(1, joined.length);
-        let pt = Math.max(0, start);
-        for (let li = 0; li < viralLines.length; li++) {
-          const line = viralLines[li]!;
-          const lineDur = dur * (line.length / denom);
-          const lineEnd =
-            li === viralLines.length - 1 ? end : pt + lineDur;
-          out.push({
-            start: pt,
-            end: Math.max(pt + 0.02, lineEnd),
-            text: line,
-          });
-          pt = lineEnd;
-        }
-        i += take;
-        break;
-      }
-      take--;
+
+  for (const chunk of chunks) {
+    const joined = chunk.map((w) => w.text.trim()).join(" ");
+    const start = chunk[0]!.startSec;
+    const end = chunk[chunk.length - 1]!.endSec;
+    const dur = Math.max(0.02, end - start);
+    const viralLines = splitLongPhraseIntoViralLines(joined);
+    const denom = Math.max(1, joined.length);
+    let pt = Math.max(0, start);
+    for (let li = 0; li < viralLines.length; li++) {
+      const line = viralLines[li]!;
+      const lineDur = dur * (line.length / denom);
+      const lineEnd =
+        li === viralLines.length - 1 ? end : pt + lineDur;
+      out.push(
+        segmentWithOptionalHighlight(
+          pt,
+          Math.max(pt + 0.02, lineEnd),
+          line
+        )
+      );
+      pt = lineEnd;
     }
   }
 

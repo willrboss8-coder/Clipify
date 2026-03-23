@@ -1,14 +1,50 @@
 import type { TranscriptSegment } from "./segmenter";
 import { viralAssMarginLRPx } from "./viral-width";
 
-/** Escape plain text for ASS Dialogue lines (avoid accidental override tags) */
-function escapeAssText(text: string): string {
-  return text
-    .trim()
+/** Soft warm accent (BGR) — premium, single highlight color */
+const VIRAL_ACCENT_PRIMARY = "&H00A8D8FF";
+const VIRAL_TEXT_WHITE = "&HFFFFFF";
+
+/** Escape a single word for ASS (inline tags use real braces). */
+function escapeAssWord(word: string): string {
+  return word
     .replace(/\\/g, "\\\\")
     .replace(/\n/g, " ")
     .replace(/\{/g, "（")
     .replace(/\}/g, "）");
+}
+
+/**
+ * Build dialogue body: \\q2 \\an2 + optional one-word \\c accent.
+ */
+function buildViralCaptionDialogueText(seg: TranscriptSegment): string {
+  const raw = seg.text.trim();
+  if (!raw) return "";
+
+  const words = raw.split(/\s+/).filter(Boolean);
+  const hi = seg.highlightWordIndex;
+
+  if (
+    hi == null ||
+    hi < 0 ||
+    hi >= words.length ||
+    words.length === 0
+  ) {
+    return `{\\q2\\an2}${words.map(escapeAssWord).join(" ")}`;
+  }
+
+  const parts: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const ew = escapeAssWord(words[i]!);
+    if (i === hi) {
+      parts.push(
+        `{\\c${VIRAL_ACCENT_PRIMARY}}${ew}{\\c${VIRAL_TEXT_WHITE}}`
+      );
+    } else {
+      parts.push(ew);
+    }
+  }
+  return `{\\q2\\an2}${parts.join(" ")}`;
 }
 
 /** Convert seconds to ASS timestamp (H:MM:SS.cc) */
@@ -47,9 +83,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const relEnd = Math.max(relStart + 0.04, seg.end);
     const t0 = secondsToAssTime(relStart);
     const t1 = secondsToAssTime(relEnd);
-    const plain = escapeAssText(seg.text);
-    if (!plain) return;
-    const body = `{\\q2\\an2}${plain}`;
+    const body = buildViralCaptionDialogueText(seg);
+    if (!body) return;
     lines.push(`Dialogue: 0,${t0},${t1},Viral,,0,0,0,,${body}`);
   });
 

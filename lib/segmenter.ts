@@ -2,6 +2,8 @@ export interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
+  /** Viral captions: 0-based index of word to accent (inline ASS color), optional */
+  highlightWordIndex?: number;
 }
 
 export interface Transcript {

@@ -1,4 +1,6 @@
 import type { TranscriptSegment } from "./segmenter";
+import { pickHighlightWordIndex } from "./viral-highlight";
+import { cleanTranscriptLineForCaptions } from "./viral-text-clean";
 
 const MAX_WORDS_PER_CHUNK = 3;
 
@@ -7,6 +9,111 @@ export const VIRAL_CAPTION_MAX_CHARS = 18;
 
 /** Per-chunk dwell cap — lower = snappier, then renormalized to the subtitle line window. */
 const MAX_CHUNK_SECONDS = 0.24;
+
+/**
+ * Avoid ending a chunk on a weak word when more speech follows (more natural phrase breaks).
+ */
+const BAD_CHUNK_ENDINGS = new Set(
+  [
+    "the",
+    "a",
+    "an",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "for",
+    "with",
+    "and",
+    "or",
+    "but",
+    "my",
+    "your",
+    "his",
+    "her",
+    "its",
+    "our",
+    "their",
+    "this",
+    "that",
+    "these",
+    "those",
+    "as",
+    "if",
+    "i",
+    "you",
+    "we",
+    "they",
+    "he",
+    "she",
+    "it",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "not",
+    "no",
+    "so",
+    "what",
+    "how",
+    "which",
+    "who",
+    "when",
+    "where",
+    "why",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "must",
+    "very",
+    "just",
+    "only",
+    "also",
+    "about",
+    "into",
+    "from",
+    "by",
+    "than",
+    "then",
+    "there",
+    "here",
+    "any",
+    "each",
+    "every",
+    "some",
+    "nor",
+    "here's",
+    "that's",
+    "what's",
+    "it's",
+    "i'm",
+    "we're",
+    "they're",
+  ].map((w) => w.toLowerCase())
+);
+
+function normalizeChunkWord(w: string): string {
+  return w
+    .replace(/^['"“”‘’]+|['"“”‘’]+$/g, "")
+    .replace(/[.,!?…;:]+$/g, "")
+    .toLowerCase();
+}
+
+function isBadChunkEnding(lastWord: string, hasMoreWords: boolean): boolean {
+  if (!hasMoreWords) return false;
+  return BAD_CHUNK_ENDINGS.has(normalizeChunkWord(lastWord));
+}
 
 export function lineFitsViralCharLimit(joined: string): boolean {
   return joined.length <= VIRAL_CAPTION_MAX_CHARS;
@@ -28,29 +135,65 @@ export function splitLongPhraseIntoViralLines(phrase: string): string[] {
   return lines;
 }
 
+export interface ViralTimedWordLike {
+  text: string;
+}
+
 /**
- * Up to 3 words if the joined line is ≤18 characters; else 2; else 1 (may exceed 18 until split).
+ * Same rules as chunkWordsIntoPhrases, but preserves word objects (for timestamps).
  */
-export function chunkWordsIntoPhrases(words: string[]): string[] {
+export function chunkTimedWordsIntoPhrases<T extends ViralTimedWordLike>(
+  words: T[]
+): T[][] {
   const n = words.length;
   if (n === 0) return [];
-  const phrases: string[] = [];
+  const chunks: T[][] = [];
   let i = 0;
   while (i < n) {
     const rem = n - i;
     let take = Math.min(MAX_WORDS_PER_CHUNK, rem);
+    let placed = false;
     while (take >= 1) {
       const slice = words.slice(i, i + take);
-      const joined = slice.join(" ");
-      if (lineFitsViralCharLimit(joined) || take === 1) {
-        phrases.push(joined);
-        i += take;
+      const joined = slice.map((w) => w.text.trim()).join(" ");
+      if (!lineFitsViralCharLimit(joined) && take > 1) {
+        take--;
+        continue;
+      }
+      if (take === 1) {
+        chunks.push(slice);
+        i += 1;
+        placed = true;
         break;
       }
-      take--;
+      const last = slice[slice.length - 1]!.text;
+      const hasMore = rem > take;
+      if (isBadChunkEnding(last, hasMore)) {
+        take--;
+        continue;
+      }
+      chunks.push(slice);
+      i += take;
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      chunks.push([words[i]!]);
+      i += 1;
     }
   }
-  return phrases;
+  return chunks;
+}
+
+/**
+ * Up to 3 words if line ≤18 chars; else 2; else 1.
+ * Prefers chunk boundaries that don't end on weak trailing words when more words follow.
+ */
+export function chunkWordsIntoPhrases(words: string[]): string[] {
+  const wrapped = words.map((text) => ({ text }));
+  return chunkTimedWordsIntoPhrases(wrapped).map((chunk) =>
+    chunk.map((w) => w.text).join(" ")
+  );
 }
 
 export function enforceNoOverlapStacking(events: TranscriptSegment[]): TranscriptSegment[] {
@@ -69,6 +212,25 @@ export function enforceNoOverlapStacking(events: TranscriptSegment[]): Transcrip
   return out;
 }
 
+function wordsFromCaptionLine(line: string): string[] {
+  return line.trim().split(/\s+/).filter(Boolean);
+}
+
+export function segmentWithOptionalHighlight(
+  start: number,
+  end: number,
+  text: string
+): TranscriptSegment {
+  const words = wordsFromCaptionLine(text);
+  const hi = pickHighlightWordIndex(words);
+  return {
+    start,
+    end,
+    text,
+    ...(hi != null ? { highlightWordIndex: hi } : {}),
+  };
+}
+
 /**
  * Character-weighted timing within each SRT line (longer phrases get more time, closer to speech rhythm),
  * then per-chunk cap + scale so chunks turn over quickly without drifting past the line end.
@@ -80,7 +242,8 @@ export function expandSegmentsForViralCaptions(
   const out: TranscriptSegment[] = [];
 
   for (const seg of segments) {
-    const words = seg.text.trim().split(/\s+/).filter(Boolean);
+    const cleaned = cleanTranscriptLineForCaptions(seg.text);
+    const words = cleaned.split(/\s+/).filter(Boolean);
     if (words.length === 0) continue;
 
     const dur = Math.max(0.001, seg.end - seg.start);
@@ -123,11 +286,13 @@ export function expandSegmentsForViralCaptions(
         const line = viralLines[li]!;
         const lineDur = phraseDur * (line.length / denom);
         const lineEnd = li === viralLines.length - 1 ? end : pt + lineDur;
-        out.push({
-          start: pt,
-          end: lineEnd,
-          text: line,
-        });
+        out.push(
+          segmentWithOptionalHighlight(
+            pt,
+            lineEnd,
+            line
+          )
+        );
         pt = lineEnd;
       }
       t = end;
