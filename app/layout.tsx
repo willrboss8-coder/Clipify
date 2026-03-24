@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { ClerkProvider } from "@clerk/nextjs";
 import "./globals.css";
 
+/** Avoid static prerender during `next build` when Clerk env vars are absent (e.g. Docker/Render build). */
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "Clipify",
   description:
