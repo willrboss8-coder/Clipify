@@ -12,10 +12,11 @@ import {
   proTrialUsedFromPrivateMetadata,
   VIRAL_TRIAL_FLAG_KEY,
 } from "@/lib/viral-captions";
+import { getStorageRoot } from "@/lib/storage-path";
 
 export const runtime = "nodejs";
 
-const ROOT = path.resolve(process.cwd(), "storage");
+const ROOT = getStorageRoot();
 
 function parseOutputClipFile(
   clipUrl: string

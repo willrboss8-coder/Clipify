@@ -9,10 +9,11 @@ import {
   type Transcript,
   type ClipCandidate,
 } from "@/lib/segmenter";
+import { getStorageRoot } from "@/lib/storage-path";
 
 export const runtime = "nodejs";
 
-const ROOT = path.resolve(process.cwd(), "storage");
+const ROOT = getStorageRoot();
 
 interface ClipRange {
   startSec: number;

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { copyFile, mkdir, writeFile, readFile } from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import { v4 as uuid } from "uuid";
 import { spawn } from "child_process";
@@ -8,13 +9,49 @@ import { extractAudio, cutClip, getVideoDuration } from "@/lib/ffmpeg";
 import { findBestMoments, getPreset, type Transcript } from "@/lib/segmenter";
 import { writeSrt } from "@/lib/srt";
 import { canUserProcess, recordUsage } from "@/lib/usage";
+import { getStorageRoot } from "@/lib/storage-path";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 // Next.js 14 App Router: disable default body size limit
 export const maxDuration = 300;
 
-const ROOT = path.resolve(process.cwd(), "storage");
+function jsonError(message: string, status: number) {
+  const safe = message.slice(0, 2000);
+  return NextResponse.json(
+    { error: safe },
+    {
+      status,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+    }
+  );
+}
+
+function normalizeProcessError(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return typeof err === "string" ? err : "Unknown error during processing";
+  }
+  const e = err as NodeJS.ErrnoException;
+  const msg = err.message || "";
+
+  if (e.code === "ENOENT") {
+    if (/ffmpeg|ffprobe/i.test(msg)) {
+      return "ffmpeg or ffprobe is not installed or not on PATH (required on the server).";
+    }
+    if (/python|python3/i.test(msg)) {
+      return "Python was not found. Install python3 or set PYTHON_PATH to the Python that has faster-whisper.";
+    }
+    return `Missing file or path: ${msg}`;
+  }
+  if (e.code === "EACCES" || e.code === "EPERM") {
+    return "Permission denied writing storage. Check STORAGE_ROOT and filesystem permissions.";
+  }
+  if (msg.includes("python3 exited") || msg.includes("faster-whisper")) {
+    return `Transcription failed: ${msg}`;
+  }
+  return msg;
+}
 
 function pythonExecutable(): string {
   return process.env.PYTHON_PATH?.trim() || "python3";
@@ -42,7 +79,7 @@ export async function POST(req: NextRequest) {
   try {
     const { userId } = await auth();
     if (!userId) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return jsonError("Unauthorized", 401);
     }
 
     const formData = await req.formData();
@@ -51,7 +88,16 @@ export async function POST(req: NextRequest) {
     const goal = (formData.get("goal") as string) || "default";
 
     if (!file) {
-      return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
+      return jsonError("No file uploaded", 400);
+    }
+
+    const ROOT = getStorageRoot();
+    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
+    if (!existsSync(scriptPath)) {
+      return jsonError(
+        `Transcription script missing at ${scriptPath}. Ensure the app is deployed (scripts/ included).`,
+        500
+      );
     }
 
     const jobId = uuid();
@@ -74,13 +120,15 @@ export async function POST(req: NextRequest) {
 
     const usageCheck = await canUserProcess(userId, durationMin);
     console.log(`[Usage] User plan: ${usageCheck.usage.plan}`);
-    console.log(`[Usage] Remaining minutes before job: ${Math.round(usageCheck.usage.minutesRemaining)}`);
+    console.log(
+      `[Usage] Remaining minutes before job: ${Math.round(usageCheck.usage.minutesRemaining)}`
+    );
     console.log(`[Usage] Video duration: ${durationMin.toFixed(1)} min`);
 
     if (!usageCheck.allowed) {
       return NextResponse.json(
         { error: usageCheck.message, usageLimitError: true },
-        { status: 403 }
+        { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
       );
     }
 
@@ -90,11 +138,15 @@ export async function POST(req: NextRequest) {
 
     // 3. Transcribe
     const transcriptPath = path.join(jobDir, "transcript.json");
-    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
     await runPython(scriptPath, [audioPath, transcriptPath]);
 
     const transcriptRaw = await readFile(transcriptPath, "utf-8");
-    const transcript: Transcript = JSON.parse(transcriptRaw);
+    let transcript: Transcript;
+    try {
+      transcript = JSON.parse(transcriptRaw) as Transcript;
+    } catch {
+      return jsonError("Transcription produced invalid JSON.", 500);
+    }
 
     // 4. Find best moments
     const preset = getPreset(platform, goal);
@@ -123,12 +175,7 @@ export async function POST(req: NextRequest) {
       const outputSrt = path.join(outputDir, `clip_${clipNum}.srt`);
       await copyFile(srtPath, outputSrt);
 
-      await cutClip(
-        videoPath,
-        clip.startSec,
-        clip.endSec,
-        clipPath
-      );
+      await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
 
       results.push({
         clipUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.mp4`,
@@ -142,7 +189,9 @@ export async function POST(req: NextRequest) {
 
     // Record usage after successful processing
     const updatedUsage = await recordUsage(userId, durationMin);
-    console.log(`[Usage] Remaining minutes after job: ${Math.round(updatedUsage.minutesRemaining)}`);
+    console.log(
+      `[Usage] Remaining minutes after job: ${Math.round(updatedUsage.minutesRemaining)}`
+    );
 
     return NextResponse.json({
       jobId,
@@ -155,8 +204,18 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("Process error:", message);
-    return NextResponse.json({ error: message }, { status: 500 });
+    const message = normalizeProcessError(err);
+    console.error("Process error:", err);
+    try {
+      return jsonError(message, 500);
+    } catch {
+      return new NextResponse(
+        JSON.stringify({ error: "Internal processing error" }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        }
+      );
+    }
   }
 }

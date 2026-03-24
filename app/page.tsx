@@ -666,7 +666,17 @@ export default function HomePage() {
         body: form,
       });
 
-      const data: ProcessResponse = await res.json();
+      const raw = await res.text();
+      let data: ProcessResponse;
+      try {
+        data = JSON.parse(raw) as ProcessResponse;
+      } catch {
+        throw new Error(
+          raw.trim().startsWith("<") || /internal server error/i.test(raw)
+            ? "Server error — try again in a moment."
+            : `Unexpected response: ${raw.slice(0, 160)}`
+        );
+      }
 
       if (!res.ok || data.error) {
         throw new Error(data.error || "Processing failed");

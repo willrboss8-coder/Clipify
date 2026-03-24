@@ -1,15 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { stat, readFile } from "fs/promises";
 import path from "path";
+import { getStorageRoot } from "@/lib/storage-path";
 
 export const runtime = "nodejs";
-
-const STORAGE = path.resolve(process.cwd(), "storage");
 
 export async function GET(
   _req: NextRequest,
   { params }: { params: { path: string[] } }
 ) {
+  const STORAGE = getStorageRoot();
   const segments = params.path;
 
   // Prevent path traversal

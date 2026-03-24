@@ -4,10 +4,11 @@ import { readFile, copyFile, mkdir } from "fs/promises";
 import { cutClip } from "@/lib/ffmpeg";
 import { writeSrt } from "@/lib/srt";
 import type { Transcript, TranscriptSegment } from "@/lib/segmenter";
+import { getStorageRoot } from "@/lib/storage-path";
 
 export const runtime = "nodejs";
 
-const ROOT = path.resolve(process.cwd(), "storage");
+const ROOT = getStorageRoot();
 
 interface RegenerateRequestBody {
   jobId: string;
