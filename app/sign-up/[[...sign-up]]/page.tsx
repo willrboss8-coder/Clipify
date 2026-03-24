@@ -13,8 +13,8 @@ export default function SignUpPage() {
           elements: {
             rootBox: "w-full max-w-md",
             card: "bg-gray-900 border border-gray-800 shadow-2xl rounded-2xl w-full",
-            headerTitle: "text-white text-xl font-bold",
-            headerSubtitle: "text-gray-400",
+            headerTitle: "hidden",
+            headerSubtitle: "hidden",
             socialButtonsBlockButton:
               "bg-gray-800 border border-gray-700 text-gray-200 hover:bg-gray-700 hover:text-white transition-colors",
             socialButtonsBlockButtonText: "text-gray-200 font-medium",
