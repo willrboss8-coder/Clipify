@@ -1,10 +1,9 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
-import Stripe from "stripe";
+import { getStripe } from "@/lib/stripe-server";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2026-02-25.clover",
-});
+/** Build-safe: Stripe is only created at request time via getStripe(). */
+export const dynamic = "force-dynamic";
 
 export async function POST(req: NextRequest) {
   try {
@@ -38,6 +37,7 @@ export async function POST(req: NextRequest) {
       req.headers.get("origin") ||
       `${req.nextUrl.protocol}//${req.nextUrl.host}`;
 
+    const stripe = getStripe();
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       payment_method_types: ["card"],

@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import Stripe from "stripe";
 import { clerkClient } from "@clerk/nextjs/server";
+import { getStripe } from "@/lib/stripe-server";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-  apiVersion: "2026-02-25.clover",
-});
+export const dynamic = "force-dynamic";
 
 type PaidTier = "pro" | "power";
 
@@ -36,7 +35,7 @@ async function resolveTierFromCheckoutSession(
   }
 
   try {
-    const sub = await stripe.subscriptions.retrieve(subId, {
+    const sub = await getStripe().subscriptions.retrieve(subId, {
       expand: ["items.data.price"],
     });
     const priceId = sub.items.data[0]?.price?.id;
@@ -86,7 +85,7 @@ export async function POST(req: NextRequest) {
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(
+    event = getStripe().webhooks.constructEvent(
       body,
       sig,
       process.env.STRIPE_WEBHOOK_SECRET
