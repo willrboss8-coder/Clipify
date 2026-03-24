@@ -1,12 +1,15 @@
-import { auth } from "@clerk/nextjs/server";
 import { NextRequest, NextResponse } from "next/server";
-import { getStripe } from "@/lib/stripe-server";
 
-/** Build-safe: Stripe is only created at request time via getStripe(). */
+/**
+ * Build-safe: no Clerk/Stripe at module load. Next must not execute SDK setup
+ * during `next build` / "collect page data" when env vars are missing on Render.
+ */
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
   try {
+    const { auth } = await import("@clerk/nextjs/server");
     const { userId } = await auth();
     if (!userId) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -37,6 +40,7 @@ export async function POST(req: NextRequest) {
       req.headers.get("origin") ||
       `${req.nextUrl.protocol}//${req.nextUrl.host}`;
 
+    const { getStripe } = await import("@/lib/stripe-server");
     const stripe = getStripe();
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
