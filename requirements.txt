@@ -1,0 +1,2 @@
+# Used by scripts/transcribe.py (faster-whisper). Pin for reproducible builds.
+faster-whisper>=1.0.3,<2

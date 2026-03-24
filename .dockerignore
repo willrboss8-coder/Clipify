@@ -1,0 +1,13 @@
+node_modules
+.next
+out
+storage
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.md
+.DS_Store
+*.log
+.cursor

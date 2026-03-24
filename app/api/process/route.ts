@@ -16,12 +16,16 @@ export const maxDuration = 300;
 
 const ROOT = path.resolve(process.cwd(), "storage");
 
+function pythonExecutable(): string {
+  return process.env.PYTHON_PATH?.trim() || "python3";
+}
+
 function runPython(
   scriptPath: string,
   args: string[]
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const proc = spawn("/Library/Developer/CommandLineTools/usr/bin/python3", [scriptPath, ...args]);
+    const proc = spawn(pythonExecutable(), [scriptPath, ...args]);
     let stdout = "";
     let stderr = "";
     proc.stdout.on("data", (d) => (stdout += d.toString()));
