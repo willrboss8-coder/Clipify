@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect, type DragEvent } from "react";
-import { useUser, UserButton } from "@clerk/nextjs";
+import { useUser, UserButton, useAuth, useClerk } from "@clerk/nextjs";
 import { PRO_POSITIONING, POWER_POSITIONING } from "@/lib/plans";
 import type { ViralCaptionAccess } from "@/lib/viral-captions";
 
@@ -89,8 +89,37 @@ function formatPlanMinutesForCopy(minutes: number): string {
   return minutes.toFixed(1);
 }
 
+const SESSION_EXPIRED_COPY =
+  "Your session expired. Please sign in again.";
+
+/**
+ * Clerk can refresh an expired JWT on GET, not on POST (`session-token-expired-refresh-non-eligible-non-get`).
+ * Force a fresh token, then hit a lightweight GET so cookies/session are valid before multipart POST /api/process.
+ */
+async function refreshClerkSessionForUpload(
+  getToken: (opts?: { skipCache?: boolean }) => Promise<string | null>
+): Promise<boolean> {
+  try {
+    await getToken({ skipCache: true });
+  } catch {
+    /* GET ping may still recover */
+  }
+  try {
+    const ping = await fetch("/api/usage", {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+    });
+    return ping.ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function HomePage() {
   const { user, isLoaded } = useUser();
+  const { isLoaded: authLoaded, isSignedIn, getToken } = useAuth();
+  const { redirectToSignIn } = useClerk();
   const rawPlan = user?.publicMetadata?.plan as string | undefined;
   const plan: Plan = rawPlan === "power" ? "power" : rawPlan === "pro" ? "pro" : "free";
 
@@ -710,6 +739,15 @@ export default function HomePage() {
 
   const handleGenerate = async () => {
     if (!file) return;
+    if (!authLoaded) {
+      setError("Loading your account — try again in a moment.");
+      return;
+    }
+    if (!isSignedIn) {
+      setError("Please sign in to generate clips.");
+      redirectToSignIn({ redirectUrl: window.location.href });
+      return;
+    }
     if (usage != null && usage.minutesRemaining <= 0) {
       setError(
         "You've used all your minutes this month. Upgrade for more capacity, or wait until your usage resets next month."
@@ -718,65 +756,97 @@ export default function HomePage() {
     }
     setError(null);
     setResult(null);
-    const cancel = simulateProgress();
 
     try {
-      const form = new FormData();
-      form.append("file", file);
-      form.append("platform", platform);
-      form.append("goal", goal);
+      let sessionOk = await refreshClerkSessionForUpload(getToken);
+      if (!sessionOk) {
+        setError(SESSION_EXPIRED_COPY);
+        redirectToSignIn({ redirectUrl: window.location.href });
+        return;
+      }
 
-      const res = await fetch("/api/process", {
-        method: "POST",
-        credentials: "include",
-        body: form,
-      });
-
-      const raw = await res.text();
-      let data: ProcessResponse;
+      const cancel = simulateProgress();
       try {
-        data = JSON.parse(raw) as ProcessResponse;
-      } catch {
-        throw new Error(
-          raw.trim().startsWith("<") || /internal server error/i.test(raw)
-            ? "Server error — try again in a moment."
-            : `Unexpected response: ${raw.slice(0, 160)}`
-        );
-      }
+        const buildForm = () => {
+          const form = new FormData();
+          form.append("file", file);
+          form.append("platform", platform);
+          form.append("goal", goal);
+          return form;
+        };
 
-      if (!res.ok || data.error) {
-        throw new Error(data.error || "Processing failed");
-      }
+        const postProcess = () =>
+          fetch("/api/process", {
+            method: "POST",
+            credentials: "include",
+            body: buildForm(),
+          });
 
-      setResult(data);
-      if (data.usage) {
-        setUsage({
-          minutesUsed: data.usage.minutesUsed,
-          minutesLimit: data.usage.minutesLimit,
-          minutesRemaining: data.usage.minutesRemaining,
-          plan,
+        let res = await postProcess();
+        if (res.status === 401) {
+          sessionOk = await refreshClerkSessionForUpload(getToken);
+          if (sessionOk) {
+            res = await postProcess();
+          }
+        }
+        if (res.status === 401) {
+          setError(SESSION_EXPIRED_COPY);
+          redirectToSignIn({ redirectUrl: window.location.href });
+          return;
+        }
+
+        const raw = await res.text();
+        let data: ProcessResponse;
+        try {
+          data = JSON.parse(raw) as ProcessResponse;
+        } catch {
+          throw new Error(
+            raw.trim().startsWith("<") || /internal server error/i.test(raw)
+              ? "Server error — try again in a moment."
+              : `Unexpected response: ${raw.slice(0, 160)}`
+          );
+        }
+
+        if (!res.ok || data.error) {
+          const errText = data.error || "Processing failed";
+          if (res.status === 401 || /unauthorized/i.test(errText)) {
+            setError(SESSION_EXPIRED_COPY);
+            redirectToSignIn({ redirectUrl: window.location.href });
+            return;
+          }
+          throw new Error(errText);
+        }
+
+        setResult(data);
+        if (data.usage) {
+          setUsage({
+            minutesUsed: data.usage.minutesUsed,
+            minutesLimit: data.usage.minutesLimit,
+            minutesRemaining: data.usage.minutesRemaining,
+            plan,
+          });
+        }
+        const origMap: Record<number, ClipResult> = {};
+        const initialHistory: Record<number, { startSec: number; endSec: number }[]> = {};
+        data.clips.forEach((c: ClipResult, idx: number) => {
+          origMap[idx] = { ...c };
+          initialHistory[idx] = [{ startSec: c.startSec, endSec: c.endSec }];
         });
+        setOriginalClips(origMap);
+        setPreviousClipState({});
+        setFindAnotherUsed(0);
+        setPreviousFindAnotherClip({});
+        setSeenClipHistory(initialHistory);
+        setStatusIdx(STATUS_STEPS.length - 1);
+        setStatus("Done");
+      } finally {
+        cancel();
       }
-      const origMap: Record<number, ClipResult> = {};
-      const initialHistory: Record<number, { startSec: number; endSec: number }[]> = {};
-      data.clips.forEach((c: ClipResult, idx: number) => {
-        origMap[idx] = { ...c };
-        initialHistory[idx] = [{ startSec: c.startSec, endSec: c.endSec }];
-      });
-      setOriginalClips(origMap);
-      setPreviousClipState({});
-      setFindAnotherUsed(0);
-      setPreviousFindAnotherClip({});
-      setSeenClipHistory(initialHistory);
-      setStatusIdx(STATUS_STEPS.length - 1);
-      setStatus("Done");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Something went wrong";
       setError(msg);
       setStatus(null);
       setStatusIdx(-1);
-    } finally {
-      cancel();
     }
   };
 
