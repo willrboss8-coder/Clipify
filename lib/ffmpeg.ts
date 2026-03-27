@@ -31,19 +31,16 @@ const ENCODE_ARGS = [
 
 export async function extractAudio(
   videoPath: string,
-  outputPath: string
+  outputPath: string,
+  options?: { maxDurationSec?: number }
 ): Promise<void> {
-  await run("ffmpeg", [
-    "-y",
-    "-i",
-    videoPath,
-    "-vn",
-    "-ac",
-    "1",
-    "-ar",
-    "16000",
-    outputPath,
-  ]);
+  const args = ["-y", "-i", videoPath];
+  const cap = options?.maxDurationSec;
+  if (cap != null && cap > 0 && Number.isFinite(cap)) {
+    args.push("-t", cap.toFixed(3));
+  }
+  args.push("-vn", "-ac", "1", "-ar", "16000", outputPath);
+  await run("ffmpeg", args);
 }
 
 export async function getVideoDuration(videoPath: string): Promise<number> {

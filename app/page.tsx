@@ -26,6 +26,11 @@ interface ProcessResponse {
   clips: ClipResult[];
   message?: string;
   error?: string;
+  scanInfo?: {
+    partialScan: boolean;
+    minutesScanned: number;
+    videoDurationMinutes: number;
+  };
   usage?: {
     minutesUsed: number;
     minutesLimit: number;
@@ -76,6 +81,14 @@ function fmtTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/** Remaining plan minutes as shown in “first N minutes” copy */
+function formatPlanMinutesForCopy(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes <= 0) return "0";
+  if (minutes >= 10) return String(Math.round(minutes));
+  if (minutes >= 1) return String(Math.round(minutes * 10) / 10);
+  return minutes.toFixed(1);
+}
+
 export default function HomePage() {
   const { user, isLoaded } = useUser();
   const rawPlan = user?.publicMetadata?.plan as string | undefined;
@@ -107,17 +120,45 @@ export default function HomePage() {
   } | null>(null);
   const [viralAccess, setViralAccess] = useState<ViralCaptionAccess | null>(null);
   const [viralLoadingIndex, setViralLoadingIndex] = useState<number | null>(null);
+  /** Client-side duration from file metadata (for pre-check vs plan minutes) */
+  const [videoDurationSec, setVideoDurationSec] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    fetch("/api/usage")
+    fetch("/api/usage", { credentials: "include" })
       .then((r) => r.json())
       .then((data) => {
         if (!data.error) setUsage(data);
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!file) {
+      setVideoDurationSec(null);
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    let cancelled = false;
+    const onMeta = () => {
+      if (cancelled) return;
+      const d = video.duration;
+      setVideoDurationSec(Number.isFinite(d) && d > 0 ? d : null);
+    };
+    video.onloadedmetadata = onMeta;
+    video.onerror = () => {
+      if (!cancelled) setVideoDurationSec(null);
+    };
+    video.src = url;
+    return () => {
+      cancelled = true;
+      video.removeAttribute("src");
+      URL.revokeObjectURL(url);
+    };
+  }, [file]);
 
   /** After Stripe redirects back, Clerk session may still have old `publicMetadata` until reload */
   useEffect(() => {
@@ -131,7 +172,7 @@ export default function HomePage() {
       try {
         await user.reload();
         if (cancelled) return;
-        const r = await fetch("/api/usage");
+        const r = await fetch("/api/usage", { credentials: "include" });
         const data = await r.json();
         if (!data.error) setUsage(data);
         window.history.replaceState({}, "", window.location.pathname);
@@ -150,7 +191,7 @@ export default function HomePage() {
       setViralAccess(null);
       return;
     }
-    fetch("/api/viral-captions")
+    fetch("/api/viral-captions", { credentials: "include" })
       .then((r) => r.json())
       .then((data) => {
         if (data.access) setViralAccess(data.access);
@@ -241,6 +282,7 @@ export default function HomePage() {
       try {
         const res = await fetch("/api/clip/regenerate", {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             jobId: result.jobId,
@@ -302,6 +344,7 @@ export default function HomePage() {
       try {
         const res = await fetch("/api/clip/regenerate", {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             jobId: result.jobId,
@@ -370,6 +413,7 @@ export default function HomePage() {
       try {
         const res = await fetch("/api/clip/regenerate", {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             jobId: result.jobId,
@@ -437,6 +481,7 @@ export default function HomePage() {
     try {
       const res = await fetch("/api/clip/alternative", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           jobId: result.jobId,
@@ -518,6 +563,7 @@ export default function HomePage() {
       try {
         const res = await fetch("/api/clip/regenerate", {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             jobId: result.jobId,
@@ -569,6 +615,7 @@ export default function HomePage() {
         const clipUrlBase = clip.clipUrl.split("?")[0];
         const res = await fetch("/api/viral-captions", {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ clipUrl: clipUrlBase }),
         });
@@ -594,6 +641,17 @@ export default function HomePage() {
   );
 
   const rec = getRecommendation(platform, goal);
+
+  const videoDurationMin =
+    videoDurationSec != null && videoDurationSec > 0
+      ? videoDurationSec / 60
+      : null;
+  const showPartialScanWarning =
+    usage != null &&
+    usage.minutesRemaining > 0 &&
+    videoDurationMin != null &&
+    videoDurationMin > usage.minutesRemaining;
+  const minutesExhausted = usage != null && usage.minutesRemaining <= 0;
 
   const onDrop = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -635,6 +693,7 @@ export default function HomePage() {
     try {
       const res = await fetch("/api/checkout", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tier }),
       });
@@ -651,6 +710,12 @@ export default function HomePage() {
 
   const handleGenerate = async () => {
     if (!file) return;
+    if (usage != null && usage.minutesRemaining <= 0) {
+      setError(
+        "You've used all your minutes this month. Upgrade for more capacity, or wait until your usage resets next month."
+      );
+      return;
+    }
     setError(null);
     setResult(null);
     const cancel = simulateProgress();
@@ -663,6 +728,7 @@ export default function HomePage() {
 
       const res = await fetch("/api/process", {
         method: "POST",
+        credentials: "include",
         body: form,
       });
 
@@ -809,6 +875,14 @@ export default function HomePage() {
             {result.message && (
               <div className="bg-yellow-900/30 border border-yellow-700 rounded-xl p-4 text-yellow-300 text-sm">
                 {result.message}
+              </div>
+            )}
+
+            {result.scanInfo?.partialScan && (
+              <div className="bg-amber-900/25 border border-amber-700/50 rounded-xl p-4 text-amber-100/90 text-sm leading-relaxed">
+                This run scanned only the first{" "}
+                {formatPlanMinutesForCopy(result.scanInfo.minutesScanned)} minutes of your
+                video (your plan&apos;s remaining time). Upgrade to scan full-length uploads.
               </div>
             )}
 
@@ -1169,7 +1243,11 @@ export default function HomePage() {
                         {file.name}
                       </div>
                       <div className="text-gray-500 text-sm">
-                        {(file.size / 1024 / 1024).toFixed(1)} MB — click to change
+                        {(file.size / 1024 / 1024).toFixed(1)} MB
+                        {videoDurationSec != null && (
+                          <> — {fmtTime(videoDurationSec)}</>
+                        )}{" "}
+                        — click to change
                       </div>
                     </div>
                   ) : (
@@ -1306,13 +1384,66 @@ export default function HomePage() {
                   </div>
                 </div>
 
+                {file && minutesExhausted && (
+                  <div className="bg-red-900/25 border border-red-800/60 rounded-xl p-4 text-sm text-red-200/95 leading-relaxed">
+                    <p className="font-medium text-red-100 mb-1">
+                      You&apos;ve used all your minutes this month.
+                    </p>
+                    <p className="text-red-200/90 mb-3">
+                      Upgrade to keep generating clips, or wait until your usage resets.
+                    </p>
+                    {plan !== "power" && (
+                      <button
+                        type="button"
+                        onClick={() => handleUpgrade(plan === "free" ? "pro" : "power")}
+                        className="text-sm font-semibold text-purple-300 hover:text-purple-200 underline underline-offset-2"
+                      >
+                        {plan === "free" ? "Upgrade to Pro" : "Upgrade to Power"}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {file && showPartialScanWarning && usage && (
+                  <div className="bg-amber-900/20 border border-amber-700/45 rounded-xl p-4 text-sm text-amber-100/90 leading-relaxed">
+                    <p className="font-medium text-amber-100 mb-2">
+                      This video is longer than the minutes remaining on your current plan.
+                    </p>
+                    <p className="mb-2">
+                      We&apos;ll scan only the first{" "}
+                      {formatPlanMinutesForCopy(usage.minutesRemaining)} minutes for viral
+                      clips.
+                    </p>
+                    <p className="text-amber-200/80 mb-3">
+                      Upgrade to scan the full video.
+                    </p>
+                    {plan !== "power" && (
+                      <button
+                        type="button"
+                        onClick={() => handleUpgrade(plan === "free" ? "pro" : "power")}
+                        className="text-sm font-semibold text-purple-300 hover:text-purple-200 underline underline-offset-2"
+                      >
+                        {plan === "free" ? "Upgrade to Pro" : "Upgrade to Power"}
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Generate Button */}
                 <button
                   onClick={handleGenerate}
-                  disabled={!file || isProcessing}
+                  disabled={
+                    !file ||
+                    isProcessing ||
+                    (usage != null && usage.minutesRemaining <= 0)
+                  }
                   className="w-full py-4 rounded-xl font-semibold text-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20"
                 >
-                  {isProcessing ? "Processing..." : "Generate Clips"}
+                  {isProcessing
+                    ? "Processing..."
+                    : usage != null && usage.minutesRemaining <= 0
+                      ? "No minutes remaining"
+                      : "Generate Clips"}
                 </button>
 
                 {/* Status */}

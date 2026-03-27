@@ -47,21 +47,48 @@ export async function getUserUsage(userId: string): Promise<UserUsage> {
   };
 }
 
-export async function canUserProcess(
+export interface ProcessingBudget {
+  usage: UserUsage;
+  /** False when no minutes remain this period */
+  allowed: boolean;
+  /** Minutes of audio actually transcribed: min(video length, remaining) */
+  effectiveScanMinutes: number;
+  /** Video is longer than what we will scan (partial scan) */
+  capped: boolean;
+  /** When allowed is false (exhausted quota) */
+  blockedMessage?: string;
+}
+
+/**
+ * Decide how much of a video may be processed under the current plan.
+ * When capped, only the first effectiveScanMinutes are scanned; usage is billed for that amount.
+ */
+export async function getProcessingBudget(
   userId: string,
   videoDurationMinutes: number
-): Promise<{ allowed: boolean; message?: string; usage: UserUsage }> {
+): Promise<ProcessingBudget> {
   const usage = await getUserUsage(userId);
+  const remaining = usage.minutesRemaining;
 
-  if (videoDurationMinutes > usage.minutesRemaining) {
+  if (remaining <= 0) {
     return {
-      allowed: false,
-      message: `You have ${Math.round(usage.minutesRemaining)} minutes remaining this month; this video is ${Math.round(videoDurationMinutes)} minutes long. ${PRO_POSITIONING.coreIdea} ${PRO_POSITIONING.tagline} — ${PRO_POSITIONING.valuePitch} Upgrade for more monthly capacity, or wait until your usage resets next month.`,
       usage,
+      allowed: false,
+      effectiveScanMinutes: 0,
+      capped: false,
+      blockedMessage: `You've used all your minutes this month. Upgrade for more capacity, or wait until your usage resets. ${PRO_POSITIONING.tagline} — ${PRO_POSITIONING.valuePitch}`,
     };
   }
 
-  return { allowed: true, usage };
+  const effectiveScanMinutes = Math.min(videoDurationMinutes, remaining);
+  const capped = videoDurationMinutes > remaining;
+
+  return {
+    usage,
+    allowed: true,
+    effectiveScanMinutes,
+    capped,
+  };
 }
 
 export async function recordUsage(

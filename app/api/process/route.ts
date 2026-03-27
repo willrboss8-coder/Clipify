@@ -8,8 +8,9 @@ import { auth } from "@clerk/nextjs/server";
 import { extractAudio, cutClip, getVideoDuration } from "@/lib/ffmpeg";
 import { findBestMoments, getPreset, type Transcript } from "@/lib/segmenter";
 import { writeSrt } from "@/lib/srt";
-import { canUserProcess, recordUsage } from "@/lib/usage";
+import { getProcessingBudget, recordUsage } from "@/lib/usage";
 import { getStorageRoot } from "@/lib/storage-path";
+import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -78,6 +79,7 @@ function runPython(
 export async function POST(req: NextRequest) {
   try {
     const { userId } = await auth();
+    logClerkAuthDebug("api/process:POST", req, { userId });
     if (!userId) {
       return jsonError("Unauthorized", 401);
     }
@@ -114,27 +116,47 @@ export async function POST(req: NextRequest) {
     const buffer = Buffer.from(await file.arrayBuffer());
     await writeFile(videoPath, buffer);
 
-    // 1b. Check video duration against usage limits
+    // 1b. Duration + plan budget (cap scan to remaining minutes; block if none left)
     const durationSec = await getVideoDuration(videoPath);
+    if (!Number.isFinite(durationSec) || durationSec <= 0) {
+      return jsonError("Could not read video duration. Try another file.", 400);
+    }
     const durationMin = durationSec / 60;
 
-    const usageCheck = await canUserProcess(userId, durationMin);
-    console.log(`[Usage] User plan: ${usageCheck.usage.plan}`);
+    const budget = await getProcessingBudget(userId, durationMin);
+    console.log(`[Usage] User plan: ${budget.usage.plan}`);
     console.log(
-      `[Usage] Remaining minutes before job: ${Math.round(usageCheck.usage.minutesRemaining)}`
+      `[Usage] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
     );
-    console.log(`[Usage] Video duration: ${durationMin.toFixed(1)} min`);
+    console.log(`[Usage] Video duration: ${durationMin.toFixed(2)} min`);
+    console.log(
+      `[Usage] Scan budget: ${budget.effectiveScanMinutes.toFixed(2)} min (capped=${budget.capped})`
+    );
 
-    if (!usageCheck.allowed) {
+    if (!budget.allowed) {
       return NextResponse.json(
-        { error: usageCheck.message, usageLimitError: true },
+        {
+          error: budget.blockedMessage ?? "No minutes remaining this month.",
+          usageLimitError: true,
+          usage: {
+            minutesUsed: budget.usage.minutesUsed,
+            minutesLimit: budget.usage.minutesLimit,
+            minutesRemaining: budget.usage.minutesRemaining,
+          },
+        },
         { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
       );
     }
 
-    // 2. Extract audio
+    const effectiveScanSec = budget.effectiveScanMinutes * 60;
+    const extractOpts =
+      effectiveScanSec + 0.01 < durationSec
+        ? { maxDurationSec: effectiveScanSec }
+        : undefined;
+
+    // 2. Extract audio (only first N seconds when plan-capped)
     const audioPath = path.join(jobDir, "audio.wav");
-    await extractAudio(videoPath, audioPath);
+    await extractAudio(videoPath, audioPath, extractOpts);
 
     // 3. Transcribe
     const transcriptPath = path.join(jobDir, "transcript.json");
@@ -153,12 +175,23 @@ export async function POST(req: NextRequest) {
     const clips = findBestMoments(transcript, preset);
 
     if (clips.length === 0) {
+      const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
       return NextResponse.json({
         jobId,
         preset,
         clips: [],
         message:
           "No strong moments found. The video may be too short or lack engaging content.",
+        scanInfo: {
+          partialScan: budget.capped,
+          minutesScanned: budget.effectiveScanMinutes,
+          videoDurationMinutes: durationMin,
+        },
+        usage: {
+          minutesUsed: updatedUsage.minutesUsed,
+          minutesLimit: updatedUsage.minutesLimit,
+          minutesRemaining: updatedUsage.minutesRemaining,
+        },
       });
     }
 
@@ -187,16 +220,21 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Record usage after successful processing
-    const updatedUsage = await recordUsage(userId, durationMin);
+    // Record usage for the minutes actually scanned (not full file when capped)
+    const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
     console.log(
-      `[Usage] Remaining minutes after job: ${Math.round(updatedUsage.minutesRemaining)}`
+      `[Usage] Remaining minutes after job: ${updatedUsage.minutesRemaining.toFixed(2)}`
     );
 
     return NextResponse.json({
       jobId,
       preset,
       clips: results,
+      scanInfo: {
+        partialScan: budget.capped,
+        minutesScanned: budget.effectiveScanMinutes,
+        videoDurationMinutes: durationMin,
+      },
       usage: {
         minutesUsed: updatedUsage.minutesUsed,
         minutesLimit: updatedUsage.minutesLimit,

@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1
 # Production image: Next.js + ffmpeg + Python (faster-whisper for scripts/transcribe.py)
+#
+# Clerk:
+# - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY must be present when `npm run build` runs (builder stage).
+#   Next.js inlines NEXT_PUBLIC_* into the client bundle at compile time.
+# - CLERK_SECRET_KEY must NOT appear in this file: keep it runtime-only (e.g. Render dashboard
+#   env on the running service). Do not ARG/ENV the secret into the image layers.
+#
+# Local development: use `npm run dev` + `.env.local` (not this Dockerfile). Optional:
+#   docker build --build-arg NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="$(grep ...)" .
 
 FROM node:20-bookworm-slim AS builder
 
@@ -9,6 +18,11 @@ ENV NEXT_TELEMETRY_DISABLED=1
 
 COPY package.json package-lock.json* ./
 RUN npm ci
+
+# Build-time public key only (safe to pass as build-arg; also exposed in browser bundle).
+# Empty ARG is OK for CI smoke builds; production images must pass a real pk_live_/pk_test_ value.
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=
+ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
 
 COPY . .
 RUN npm run build
