@@ -96,6 +96,28 @@ const SESSION_EXPIRED_COPY =
  * Clerk can refresh an expired JWT on GET, not on POST (`session-token-expired-refresh-non-eligible-non-get`).
  * Force a fresh token, then hit a lightweight GET so cookies/session are valid before multipart POST /api/process.
  */
+function messageForFailedProcessResponse(
+  res: Response,
+  raw: string,
+  parseErr?: boolean
+): string {
+  if (res.status === 504 || res.status === 408) {
+    return "Processing timed out (the server stopped waiting). Try a shorter video, or try again — the service may be busy.";
+  }
+  if (res.status === 502 || res.status === 503) {
+    return "Service temporarily unavailable. Try again in a moment.";
+  }
+  if (res.status === 413) {
+    return "Upload too large for the server. Try a smaller file or a lower resolution export.";
+  }
+  if (parseErr || !raw.trim()) {
+    return raw.trim().startsWith("<")
+      ? "Server returned an error page instead of results. Try again, or contact support if this keeps happening."
+      : "Could not read the server response. Try again.";
+  }
+  return "Processing failed. Try again.";
+}
+
 async function refreshClerkSessionForUpload(
   getToken: (opts?: { skipCache?: boolean }) => Promise<string | null>
 ): Promise<boolean> {
@@ -756,6 +778,8 @@ export default function HomePage() {
     }
     setError(null);
     setResult(null);
+    setStatus(null);
+    setStatusIdx(-1);
 
     try {
       let sessionOk = await refreshClerkSessionForUpload(getToken);
@@ -801,20 +825,31 @@ export default function HomePage() {
           data = JSON.parse(raw) as ProcessResponse;
         } catch {
           throw new Error(
-            raw.trim().startsWith("<") || /internal server error/i.test(raw)
-              ? "Server error — try again in a moment."
-              : `Unexpected response: ${raw.slice(0, 160)}`
+            messageForFailedProcessResponse(res, raw, true)
           );
         }
 
         if (!res.ok || data.error) {
-          const errText = data.error || "Processing failed";
+          const errText =
+            typeof data.error === "string" && data.error
+              ? data.error
+              : messageForFailedProcessResponse(res, raw);
           if (res.status === 401 || /unauthorized/i.test(errText)) {
             setError(SESSION_EXPIRED_COPY);
             redirectToSignIn({ redirectUrl: window.location.href });
             return;
           }
           throw new Error(errText);
+        }
+
+        if (
+          typeof data.jobId !== "string" ||
+          !data.jobId ||
+          !Array.isArray(data.clips)
+        ) {
+          throw new Error(
+            "Invalid response from server (missing job or clips). Try again or contact support."
+          );
         }
 
         setResult(data);
@@ -843,14 +878,21 @@ export default function HomePage() {
         cancel();
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Something went wrong";
+      const msg =
+        err instanceof Error && err.message
+          ? err.message
+          : err instanceof TypeError && err.message.includes("fetch")
+            ? "Network error — check your connection and try again."
+            : "Something went wrong while finishing processing. Try again.";
       setError(msg);
-      setStatus(null);
-      setStatusIdx(-1);
+      // Keep status/steps visible so users see where the run failed (e.g. stuck on "Finalizing results").
     }
   };
 
-  const isProcessing = statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1;
+  const isProcessing =
+    !error &&
+    statusIdx >= 0 &&
+    statusIdx < STATUS_STEPS.length - 1;
 
   return (
     <div className="min-h-screen">
@@ -1516,8 +1558,8 @@ export default function HomePage() {
                       : "Generate Clips"}
                 </button>
 
-                {/* Status */}
-                {status && !result && !error && (
+                {/* Status (show even when error is set so failure isn’t mistaken for a blank reset) */}
+                {status && !result && (
                   <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-5">
                     <div className="space-y-2">
                       {STATUS_STEPS.map((step, i) => (
@@ -1559,7 +1601,7 @@ export default function HomePage() {
                 {/* Error */}
                 {error && (
                   <div className="bg-red-900/30 border border-red-800 rounded-xl p-4 text-red-300 text-sm">
-                    <span className="font-semibold">Error:</span> {error}
+                    <span className="font-semibold">Couldn&apos;t finish:</span> {error}
                   </div>
                 )}
               </div>
