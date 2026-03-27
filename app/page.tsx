@@ -4,39 +4,7 @@ import { useState, useRef, useCallback, useEffect, type DragEvent } from "react"
 import { useUser, UserButton, useAuth, useClerk } from "@clerk/nextjs";
 import { PRO_POSITIONING, POWER_POSITIONING } from "@/lib/plans";
 import type { ViralCaptionAccess } from "@/lib/viral-captions";
-
-interface Preset {
-  minLen: number;
-  maxLen: number;
-  count: number;
-}
-
-interface ClipResult {
-  clipUrl: string;
-  srtUrl: string;
-  hook: string;
-  confidence: number;
-  startSec: number;
-  endSec: number;
-}
-
-interface ProcessResponse {
-  jobId: string;
-  preset: Preset;
-  clips: ClipResult[];
-  message?: string;
-  error?: string;
-  scanInfo?: {
-    partialScan: boolean;
-    minutesScanned: number;
-    videoDurationMinutes: number;
-  };
-  usage?: {
-    minutesUsed: number;
-    minutesLimit: number;
-    minutesRemaining: number;
-  };
-}
+import type { ClipResult, ProcessResponse } from "@/lib/types/clip-job";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -91,6 +59,44 @@ function formatPlanMinutesForCopy(minutes: number): string {
 
 const SESSION_EXPIRED_COPY =
   "Your session expired. Please sign in again.";
+
+/** Poll background job until completed or failed (long videos; HTTP request no longer blocks). */
+const JOB_POLL_INTERVAL_MS = 2500;
+const JOB_POLL_MAX_MS = 2 * 60 * 60 * 1000;
+
+async function pollJobUntilComplete(jobId: string): Promise<ProcessResponse> {
+  const deadline = Date.now() + JOB_POLL_MAX_MS;
+  while (Date.now() < deadline) {
+    const r = await fetch(`/api/jobs/${jobId}`, {
+      credentials: "include",
+      cache: "no-store",
+    });
+    if (r.status === 401) {
+      throw new Error(SESSION_EXPIRED_COPY);
+    }
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(
+        t.trim().slice(0, 300) || "Failed to load job status"
+      );
+    }
+    const data = (await r.json()) as {
+      status: string;
+      result?: ProcessResponse;
+      error?: string;
+    };
+    if (data.status === "completed" && data.result) {
+      return data.result;
+    }
+    if (data.status === "failed") {
+      throw new Error(data.error || "Processing failed");
+    }
+    await new Promise((res) => setTimeout(res, JOB_POLL_INTERVAL_MS));
+  }
+  throw new Error(
+    "Processing is taking longer than expected. Try a shorter video or try again later."
+  );
+}
 
 /**
  * Clerk can refresh an expired JWT on GET, not on POST (`session-token-expired-refresh-non-eligible-non-get`).
@@ -820,19 +826,19 @@ export default function HomePage() {
         }
 
         const raw = await res.text();
-        let data: ProcessResponse;
+        let parsed: Record<string, unknown>;
         try {
-          data = JSON.parse(raw) as ProcessResponse;
+          parsed = JSON.parse(raw) as Record<string, unknown>;
         } catch {
           throw new Error(
             messageForFailedProcessResponse(res, raw, true)
           );
         }
 
-        if (!res.ok || data.error) {
+        if (!res.ok) {
           const errText =
-            typeof data.error === "string" && data.error
-              ? data.error
+            typeof parsed.error === "string" && parsed.error
+              ? parsed.error
               : messageForFailedProcessResponse(res, raw);
           if (res.status === 401 || /unauthorized/i.test(errText)) {
             setError(SESSION_EXPIRED_COPY);
@@ -842,13 +848,27 @@ export default function HomePage() {
           throw new Error(errText);
         }
 
+        if (res.status !== 202) {
+          throw new Error(
+            "Unexpected response from server. Try again or update the app."
+          );
+        }
+
+        const jobId =
+          typeof parsed.jobId === "string" ? parsed.jobId : "";
+        if (!jobId) {
+          throw new Error("Server did not return a job id.");
+        }
+
+        const data = await pollJobUntilComplete(jobId);
+
         if (
           typeof data.jobId !== "string" ||
           !data.jobId ||
           !Array.isArray(data.clips)
         ) {
           throw new Error(
-            "Invalid response from server (missing job or clips). Try again or contact support."
+            "Invalid result from server (missing job or clips). Try again or contact support."
           );
         }
 
