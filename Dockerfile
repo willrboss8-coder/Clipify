@@ -52,10 +52,16 @@ ENV PATH="/opt/venv/bin:$PATH"
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
+# Worker + pipeline: not bundled into standalone server chunks; copy source for `npm run worker`
+COPY --from=builder /app/lib ./lib
 COPY --from=builder /app/scripts ./scripts
+COPY --from=builder /app/tsconfig.json ./
+# Add tsx next to standalone's existing node_modules (do not replace package.json from standalone)
+RUN npm install tsx@4.19.2 --omit=dev --no-save
 
 RUN mkdir -p storage \
-    && chown -R node:node /app
+    && chown -R node:node /app \
+    && chmod +x scripts/start-web-and-worker.sh
 
 # Render sets PORT; listen on all interfaces
 EXPOSE 3000
@@ -64,4 +70,5 @@ ENV HOSTNAME="0.0.0.0"
 
 USER node
 
-CMD ["node", "server.js"]
+# Web + worker share STORAGE_ROOT and the same persistent disk (single Render service).
+CMD ["bash", "scripts/start-web-and-worker.sh"]

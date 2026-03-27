@@ -9,13 +9,12 @@ import { getProcessingBudget } from "@/lib/usage";
 import { getStorageRoot } from "@/lib/storage-path";
 import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 import { writeJobRecord } from "@/lib/jobStore";
-import { runProcessJob } from "@/lib/runProcessJob";
 import type { JobRecord } from "@/lib/types/clip-job";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Upload + ffprobe + budget only; heavy work runs in background via runProcessJob. */
+/** Upload + ffprobe + budget only; heavy work runs in the worker process (see scripts/worker.ts). */
 export const maxDuration = 120;
 
 function jsonError(message: string, status: number) {
@@ -111,24 +110,12 @@ export async function POST(req: NextRequest) {
     };
     await writeJobRecord(record);
 
-    setImmediate(() => {
-      void runProcessJob({
-        jobId,
-        userId,
-        ROOT,
-        platform,
-        goal,
-      }).catch((err) => {
-        console.error(`[Job ${jobId}] Unhandled runProcessJob rejection:`, err);
-      });
-    });
-
     return NextResponse.json(
       {
         jobId,
         status: "queued",
         message:
-          "Processing started. Poll GET /api/jobs/[jobId] until status is completed.",
+          "Job queued. Poll GET /api/jobs/[jobId] until status is completed (processed by background worker).",
       },
       {
         status: 202,
