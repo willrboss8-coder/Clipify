@@ -70,5 +70,5 @@ ENV HOSTNAME="0.0.0.0"
 
 USER node
 
-# Web + worker share STORAGE_ROOT and the same persistent disk (single Render service).
+# Web + transcribe worker + main worker (CLIP_PIPE_SPLIT_TRANSCRIBE) share STORAGE_ROOT / disk.
 CMD ["bash", "scripts/start-web-and-worker.sh"]

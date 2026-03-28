@@ -1,31 +1,25 @@
 /**
- * Background worker: polls STORAGE_ROOT/jobs for queued jobs, claims one at a time,
- * runs lib/runProcessJob.ts. Intended for Render Background Worker or local `npm run worker`.
+ * Transcribe-stage worker: claims queued jobs, runs extract + faster-whisper only,
+ * then hands off to the main worker (CLIP_PIPE_SPLIT_TRANSCRIBE=1 on main) for the rest.
  *
- * Requires the same STORAGE_ROOT (and ideally the same persistent disk) as the web service
- * so uploads and state.json are visible.
+ * Uses filesystem lease-transcribe.lock (see lib/pipeline/lease.ts). Requires same STORAGE_ROOT
+ * as the web app and main worker.
  */
 
 import { readdir, stat, readFile, unlink } from "fs/promises";
 import path from "path";
 import { getStorageRoot } from "@/lib/storage-path";
 import { readJobRecord } from "@/lib/jobStore";
-import { tryClaimJob } from "@/lib/jobClaim";
-import {
-  runProcessJob,
-  runProcessJobFromMomentSelection,
-  isPipelineSplitTranscribe,
-} from "@/lib/runProcessJob";
+import { tryClaimJob, releaseClaim } from "@/lib/jobClaim";
+import { getNextStageWorkerKind } from "@/lib/pipeline";
+import { runTranscribeWorkerJob } from "@/lib/runProcessJob";
 import type { JobRecord } from "@/lib/types/clip-job";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const POLL_MS = 3000;
-/** If claim.lock exists but state is still queued, release lock after this age (crashed worker). */
 const STALE_QUEUED_LOCK_MS = 5 * 60 * 1000;
-
-const SPLIT_TRANSCRIBE = isPipelineSplitTranscribe();
 
 async function recoverStaleQueuedClaims(ROOT: string): Promise<void> {
   const jobsRoot = path.join(ROOT, "jobs");
@@ -63,7 +57,7 @@ async function recoverStaleQueuedClaims(ROOT: string): Promise<void> {
     if (age > STALE_QUEUED_LOCK_MS) {
       await unlink(lockPath);
       console.log(
-        `[Worker] Released stale claim.lock for ${id} (queued, lock age ${Math.round(age / 1000)}s)`
+        `[Transcribe-worker] Released stale claim.lock for ${id} (queued, lock age ${Math.round(age / 1000)}s)`
       );
     }
   }
@@ -82,36 +76,25 @@ async function tick(ROOT: string): Promise<void> {
   for (const id of dirs) {
     if (!UUID_RE.test(id)) continue;
     const rec = await readJobRecord(id);
-    if (!rec) continue;
-
-    if (SPLIT_TRANSCRIBE) {
-      if (rec.status !== "processing" || rec.stage !== "transcribed") continue;
-      const claimedAtMs = Date.now();
-      console.log(`[Worker] Post-transcribe pipeline for job ${id}`);
-      await runProcessJobFromMomentSelection({
-        jobId: id,
-        userId: rec.userId,
-        ROOT,
-        platform: rec.platform,
-        goal: rec.goal,
-        claimedAtMs,
-      });
-      continue;
-    }
-
-    if (rec.status !== "queued") continue;
+    if (!rec || rec.status !== "queued") continue;
 
     const claimed = await tryClaimJob(id);
     if (!claimed) continue;
 
+    const after = await readJobRecord(id);
+    if (!after || getNextStageWorkerKind(after) !== "transcribe") {
+      await releaseClaim(id).catch(() => {});
+      continue;
+    }
+
     const claimedAtMs = Date.now();
-    console.log(`[Worker] Claimed job ${id}`);
-    await runProcessJob({
+    console.log(`[Transcribe-worker] Claimed job ${id} (transcribe stage)`);
+    await runTranscribeWorkerJob({
       jobId: id,
-      userId: rec.userId,
+      userId: after.userId,
       ROOT,
-      platform: rec.platform,
-      goal: rec.goal,
+      platform: after.platform,
+      goal: after.goal,
       claimedAtMs,
     });
   }
@@ -120,14 +103,14 @@ async function tick(ROOT: string): Promise<void> {
 async function main(): Promise<void> {
   const ROOT = getStorageRoot();
   console.log(
-    `[Worker] clipify-worker started | STORAGE_ROOT=${ROOT} | pid=${process.pid} | SPLIT_TRANSCRIBE=${SPLIT_TRANSCRIBE}`
+    `[Transcribe-worker] started | STORAGE_ROOT=${ROOT} | pid=${process.pid}`
   );
 
   for (;;) {
     try {
       await tick(ROOT);
     } catch (err) {
-      console.error("[Worker] tick error:", err);
+      console.error("[Transcribe-worker] tick error:", err);
     }
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
