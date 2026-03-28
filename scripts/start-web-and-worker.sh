@@ -2,7 +2,9 @@
 # Single-container entrypoint: Next.js web + transcribe worker + main worker (split pipeline).
 # Shared STORAGE_ROOT/disk. If any process exits, the others are stopped and the container exits.
 #
-# Portable: no wait -n (macOS ships bash 3.2). Uses parallel wait subshells + polling.
+# Portable: no wait -n (macOS bash 3.2). Each service runs inside a wrapper subshell that owns
+# its child process; we never "wait" a PID that belongs to another shell (avoids
+# "wait: pid N is not a child of this shell").
 #
 # Main worker runs with CLIP_PIPE_SPLIT_TRANSCRIBE=1 (post-transcribe stages only); transcribe
 # worker claims queued jobs and runs extract+faster-whisper. See lib/runProcessJob.ts.
@@ -24,20 +26,18 @@ term_handler() {
 }
 trap term_handler SIGTERM SIGINT
 
-node server.js &
+# Wrapper subshells: each runs one command and writes its exit code. Only this shell may wait
+# on WEB_PID / TRANSCRIBE_PID / WORKER_PID (they are direct children of this script).
+( node server.js; ec=$?; echo "$ec" >"$WAIT_TMP/exit.web"; exit "$ec" ) &
 WEB_PID=$!
 
-npm run worker:transcribe &
+( npm run worker:transcribe; ec=$?; echo "$ec" >"$WAIT_TMP/exit.transcribe"; exit "$ec" ) &
 TRANSCRIBE_PID=$!
 
-CLIP_PIPE_SPLIT_TRANSCRIBE=1 npm run worker &
+( CLIP_PIPE_SPLIT_TRANSCRIBE=1 npm run worker; ec=$?; echo "$ec" >"$WAIT_TMP/exit.worker"; exit "$ec" ) &
 WORKER_PID=$!
 
-# First process to exit: each subshell waits one child and writes its exit code (no wait -n).
-( wait "$WEB_PID"; echo $? >"$WAIT_TMP/exit.web" ) &
-( wait "$TRANSCRIBE_PID"; echo $? >"$WAIT_TMP/exit.transcribe" ) &
-( wait "$WORKER_PID"; echo $? >"$WAIT_TMP/exit.worker" ) &
-
+# First wrapper to finish writes its exit file; poll until one exists.
 WAIT_STATUS=0
 set +e
 while true; do
