@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { mkdir, writeFile } from "fs/promises";
-import { existsSync } from "fs";
 import path from "path";
 import { v4 as uuid } from "uuid";
 import { auth } from "@clerk/nextjs/server";
 import { getVideoDuration } from "@/lib/ffmpeg";
 import { getProcessingBudget } from "@/lib/usage";
 import { getStorageRoot } from "@/lib/storage-path";
+import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 import { writeJobRecord } from "@/lib/jobStore";
 import type { JobRecord } from "@/lib/types/clip-job";
@@ -46,10 +46,9 @@ export async function POST(req: NextRequest) {
     }
 
     const ROOT = getStorageRoot();
-    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
-    if (!existsSync(scriptPath)) {
+    if (!hasTranscriptionScript()) {
       return jsonError(
-        `Transcription script missing at ${scriptPath}. Ensure the app is deployed (scripts/ included).`,
+        "Transcription scripts missing (expected scripts/transcribe_daemon.py or scripts/transcribe.py). Ensure the app is deployed (scripts/ included).",
         500
       );
     }

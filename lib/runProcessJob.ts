@@ -1,4 +1,3 @@
-import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import path from "path";
 import { getVideoDuration } from "@/lib/ffmpeg";
@@ -18,6 +17,7 @@ import {
   createFilesystemStageLeaseBackend,
   type StageLeaseBackend,
 } from "@/lib/pipeline";
+import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 
 function logPipelineTiming(
   jobId: string,
@@ -186,9 +186,9 @@ export async function runTranscribeWorkerJob(
       return;
     }
 
-    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
-    if (!existsSync(scriptPath)) {
-      const msg = `Transcription script missing at ${scriptPath}`;
+    if (!hasTranscriptionScript()) {
+      const msg =
+        "Transcription script missing (expected scripts/transcribe_daemon.py or scripts/transcribe.py)";
       await writeJobRecord(
         patchJobRecord(existing, { status: "failed", error: msg })
       );
@@ -196,6 +196,7 @@ export async function runTranscribeWorkerJob(
       return;
     }
 
+    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
     const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
@@ -304,9 +305,9 @@ export async function runProcessJobFromMomentSelection(
       return;
     }
 
-    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
-    if (!existsSync(scriptPath)) {
-      const msg = `Transcription script missing at ${scriptPath}`;
+    if (!hasTranscriptionScript()) {
+      const msg =
+        "Transcription script missing (expected scripts/transcribe_daemon.py or scripts/transcribe.py)";
       const tSave = performance.now();
       await writeJobRecord(
         patchJobRecord(existing, { status: "failed", error: msg })
@@ -436,9 +437,9 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
       return;
     }
 
-    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
-    if (!existsSync(scriptPath)) {
-      const msg = `Transcription script missing at ${scriptPath}`;
+    if (!hasTranscriptionScript()) {
+      const msg =
+        "Transcription script missing (expected scripts/transcribe_daemon.py or scripts/transcribe.py)";
       const tSave = performance.now();
       await writeJobRecord(
         patchJobRecord(existing, { status: "failed", error: msg })
@@ -447,6 +448,7 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
       return;
     }
 
+    const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
     const outputDir = path.join(ROOT, "outputs", jobId);

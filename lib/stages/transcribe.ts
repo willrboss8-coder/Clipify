@@ -3,6 +3,10 @@ import { spawn } from "child_process";
 import { extractAudio } from "@/lib/ffmpeg";
 import type { Transcript } from "@/lib/segmenter";
 import { persistPipelineStage } from "@/lib/stages/persist";
+import {
+  isTranscribeDaemonEnabled,
+  runPersistentTranscribe,
+} from "@/lib/persistent-transcribe";
 
 function pythonExecutable(): string {
   return process.env.PYTHON_PATH?.trim() || "python3";
@@ -67,7 +71,11 @@ export async function runExtractAndTranscribeStage(params: {
   let transcribeSec: number;
   {
     const t0 = performance.now();
-    await runPython(scriptPath, [audioPath, transcriptPath]);
+    if (isTranscribeDaemonEnabled()) {
+      await runPersistentTranscribe(audioPath, transcriptPath);
+    } else {
+      await runPython(scriptPath, [audioPath, transcriptPath]);
+    }
 
     const transcriptRaw = await readFile(transcriptPath, "utf-8");
     try {
