@@ -194,10 +194,12 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
           },
         };
       } else {
-        const results = [];
-        for (let i = 0; i < Math.min(clips.length, 2); i++) {
-          const clip = clips[i];
-          const clipNum = i + 1;
+        const toRender = clips.slice(0, 2);
+
+        const renderOneClip = async (
+          clip: (typeof clips)[number],
+          clipNum: number
+        ) => {
           const srtPath = path.join(jobDir, `clip_${clipNum}.srt`);
           const clipPath = path.join(outputDir, `clip_${clipNum}.mp4`);
 
@@ -206,26 +208,30 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
           const outputSrt = path.join(outputDir, `clip_${clipNum}.srt`);
           await copyFile(srtPath, outputSrt);
 
-          {
-            const tCut = performance.now();
-            await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
-            const dur = (performance.now() - tCut) / 1000;
-            if (i === 0) clip1RenderSec = dur;
-            else clip2RenderSec = dur;
-          }
+          const tCut = performance.now();
+          await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
+          const cutSec = (performance.now() - tCut) / 1000;
 
-          results.push({
-            clipUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.mp4`,
-            srtUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.srt`,
-            hook: clip.hook,
-            confidence: clip.confidence,
-            startSec: clip.startSec,
-            endSec: clip.endSec,
-          }        );
-        }
-        if (clips.length === 1) {
-          clip2RenderSec = 0;
-        }
+          return {
+            cutSec,
+            result: {
+              clipUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.mp4`,
+              srtUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.srt`,
+              hook: clip.hook,
+              confidence: clip.confidence,
+              startSec: clip.startSec,
+              endSec: clip.endSec,
+            },
+          };
+        };
+
+        const rendered = await Promise.all(
+          toRender.map((clip, i) => renderOneClip(clip, i + 1))
+        );
+
+        const results = rendered.map((r) => r.result);
+        clip1RenderSec = rendered[0]!.cutSec;
+        clip2RenderSec = rendered.length > 1 ? rendered[1]!.cutSec : 0;
 
         const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
         console.log(
