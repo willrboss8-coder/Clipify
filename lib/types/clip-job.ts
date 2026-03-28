@@ -35,6 +35,16 @@ export interface ProcessResponse {
 
 export type JobStatus = "queued" | "processing" | "completed" | "failed";
 
+/**
+ * Internal pipeline progress (persisted for staged-worker foundation).
+ * Not returned by GET /api/jobs/[jobId] — API shape unchanged for clients.
+ */
+export type JobPipelineStage =
+  | "transcribed"
+  | "moments_selected"
+  | "clips_rendered"
+  | "finalized";
+
 export interface JobRecord {
   jobId: string;
   userId: string;
@@ -46,4 +56,6 @@ export interface JobRecord {
   error?: string;
   /** Present when status === "completed" */
   result?: ProcessResponse;
+  /** Latest completed pipeline stage while status is processing (or finalized when completed). */
+  stage?: JobPipelineStage;
 }

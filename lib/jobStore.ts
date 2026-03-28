@@ -32,7 +32,7 @@ export async function readJobRecord(jobId: string): Promise<JobRecord | null> {
 
 export function patchJobRecord(
   prev: JobRecord,
-  patch: Partial<Pick<JobRecord, "status" | "error" | "result">>
+  patch: Partial<Pick<JobRecord, "status" | "error" | "result" | "stage">>
 ): JobRecord {
   return {
     ...prev,
