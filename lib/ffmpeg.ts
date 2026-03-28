@@ -24,7 +24,7 @@ function run(
 }
 
 const ENCODE_ARGS = [
-  "-c:v", "libx264", "-preset", "fast",
+  "-c:v", "libx264", "-preset", "veryfast",
   "-c:a", "aac", "-b:a", "128k",
   "-movflags", "+faststart",
 ];
@@ -120,7 +120,7 @@ export async function cutClip(
 /** Re-encode video with libass `ass` filter; requires ffmpeg built with libass */
 const BURN_VIRAL_ENCODE = [
   "-c:v", "libx264",
-  "-preset", "fast",
+  "-preset", "veryfast",
   "-c:a", "copy",
   "-movflags", "+faststart",
 ];
