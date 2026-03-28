@@ -20,7 +20,7 @@ def main():
 
     model = WhisperModel("base", device="cpu", compute_type="int8")
 
-    segments_iter, info = model.transcribe(audio_path, beam_size=5)
+    segments_iter, info = model.transcribe(audio_path, beam_size=1)
 
     segments = []
     for segment in segments_iter:
