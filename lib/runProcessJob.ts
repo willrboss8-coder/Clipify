@@ -1,15 +1,17 @@
-import { copyFile, readFile } from "fs/promises";
 import { existsSync } from "fs";
 import path from "path";
-import { spawn } from "child_process";
-import { extractAudio, cutClip, getVideoDuration } from "@/lib/ffmpeg";
-import { findBestMoments, getPreset, type Transcript } from "@/lib/segmenter";
-import { writeSrt } from "@/lib/srt";
-import { getProcessingBudget, recordUsage, type ProcessingBudget } from "@/lib/usage";
+import { getVideoDuration } from "@/lib/ffmpeg";
+import { getProcessingBudget } from "@/lib/usage";
 import { readJobRecord, writeJobRecord, patchJobRecord } from "@/lib/jobStore";
 import { releaseClaim } from "@/lib/jobClaim";
 import { normalizeProcessError } from "@/lib/process-job-errors";
-import type { JobPipelineStage, ProcessResponse } from "@/lib/types/clip-job";
+import {
+  runExtractAndTranscribeStage,
+  runMomentSelectionStage,
+  runClipRenderStage,
+  runFinalizeStage,
+} from "@/lib/stages";
+import { createNoopLeaseBackend } from "@/lib/pipeline";
 
 function logPipelineTiming(
   jobId: string,
@@ -41,255 +43,6 @@ function logPipelineTiming(
   console.log(`[Job ${jobId}] timing ${parts.join(" ")}`);
 }
 
-function pythonExecutable(): string {
-  return process.env.PYTHON_PATH?.trim() || "python3";
-}
-
-function runPython(
-  scriptPath: string,
-  args: string[]
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(pythonExecutable(), [scriptPath, ...args]);
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => (stdout += d.toString()));
-    proc.stderr.on("data", (d) => (stderr += d.toString()));
-    proc.on("close", (code) => {
-      if (code !== 0) reject(new Error(`python3 exited ${code}: ${stderr}`));
-      else resolve({ stdout, stderr });
-    });
-    proc.on("error", reject);
-  });
-}
-
-async function persistPipelineStage(
-  jobId: string,
-  stage: JobPipelineStage
-): Promise<void> {
-  const latest = await readJobRecord(jobId);
-  if (!latest) return;
-  await writeJobRecord(patchJobRecord(latest, { stage }));
-}
-
-interface ExtractTranscribeResult {
-  transcript: Transcript;
-  extractSec: number;
-  transcribeSec: number;
-}
-
-async function runExtractAndTranscribeStage(params: {
-  jobId: string;
-  scriptPath: string;
-  videoPath: string;
-  audioPath: string;
-  transcriptPath: string;
-  extractOpts?: { maxDurationSec: number };
-  claimedAtMs: number;
-}): Promise<{ result: ExtractTranscribeResult; claimToProcessingStartSec: number }> {
-  const {
-    jobId,
-    scriptPath,
-    videoPath,
-    audioPath,
-    transcriptPath,
-    extractOpts,
-    claimedAtMs,
-  } = params;
-
-  const claimToProcessingStartSec = (Date.now() - claimedAtMs) / 1000;
-
-  let extractSec: number;
-  {
-    const t0 = performance.now();
-    await extractAudio(videoPath, audioPath, extractOpts);
-    extractSec = (performance.now() - t0) / 1000;
-  }
-
-  let transcript: Transcript;
-  let transcribeSec: number;
-  {
-    const t0 = performance.now();
-    await runPython(scriptPath, [audioPath, transcriptPath]);
-
-    const transcriptRaw = await readFile(transcriptPath, "utf-8");
-    try {
-      transcript = JSON.parse(transcriptRaw) as Transcript;
-    } catch {
-      throw new Error("Transcription produced invalid JSON.");
-    }
-    transcribeSec = (performance.now() - t0) / 1000;
-  }
-
-  await persistPipelineStage(jobId, "transcribed");
-
-  return {
-    result: { transcript, extractSec, transcribeSec },
-    claimToProcessingStartSec,
-  };
-}
-
-interface MomentSelectionResult {
-  preset: ReturnType<typeof getPreset>;
-  clips: ReturnType<typeof findBestMoments>;
-  momentSelectionSec: number;
-}
-
-async function runMomentSelectionStage(params: {
-  jobId: string;
-  platform: string;
-  goal: string;
-  transcript: Transcript;
-}): Promise<MomentSelectionResult> {
-  const { jobId, platform, goal, transcript } = params;
-
-  let preset: ReturnType<typeof getPreset>;
-  let clips: ReturnType<typeof findBestMoments>;
-  let momentSelectionSec: number;
-  {
-    const t0 = performance.now();
-    preset = getPreset(platform, goal);
-    clips = findBestMoments(transcript, preset);
-    momentSelectionSec = (performance.now() - t0) / 1000;
-  }
-
-  await persistPipelineStage(jobId, "moments_selected");
-
-  return { preset, clips, momentSelectionSec };
-}
-
-/** ProcessResponse fields before usage is applied in finalize. */
-interface ClipRenderStageResult {
-  pendingResult: Omit<ProcessResponse, "usage">;
-  clip1RenderSec: number;
-  clip2RenderSec: number;
-}
-
-async function runClipRenderStage(params: {
-  jobId: string;
-  videoPath: string;
-  jobDir: string;
-  outputDir: string;
-  preset: ReturnType<typeof getPreset>;
-  clips: ReturnType<typeof findBestMoments>;
-  budget: ProcessingBudget;
-  durationMin: number;
-}): Promise<ClipRenderStageResult> {
-  const { jobId, videoPath, jobDir, outputDir, preset, clips, budget, durationMin } =
-    params;
-
-  if (clips.length === 0) {
-    await persistPipelineStage(jobId, "clips_rendered");
-    return {
-      pendingResult: {
-        jobId,
-        preset,
-        clips: [],
-        message:
-          "No strong moments found. The video may be too short or lack engaging content.",
-        scanInfo: {
-          partialScan: budget.capped,
-          minutesScanned: budget.effectiveScanMinutes,
-          videoDurationMinutes: durationMin,
-        },
-      },
-      clip1RenderSec: 0,
-      clip2RenderSec: 0,
-    };
-  }
-
-  const results = [];
-  let clip1RenderSec = 0;
-  let clip2RenderSec = 0;
-
-  for (let i = 0; i < Math.min(clips.length, 2); i++) {
-    const clip = clips[i];
-    const clipNum = i + 1;
-    const srtPath = path.join(jobDir, `clip_${clipNum}.srt`);
-    const clipPath = path.join(outputDir, `clip_${clipNum}.mp4`);
-
-    await writeSrt(clip.segments, clip.startSec, srtPath);
-
-    const outputSrt = path.join(outputDir, `clip_${clipNum}.srt`);
-    await copyFile(srtPath, outputSrt);
-
-    {
-      const tCut = performance.now();
-      await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
-      const dur = (performance.now() - tCut) / 1000;
-      if (i === 0) clip1RenderSec = dur;
-      else clip2RenderSec = dur;
-    }
-
-    results.push({
-      clipUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.mp4`,
-      srtUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.srt`,
-      hook: clip.hook,
-      confidence: clip.confidence,
-      startSec: clip.startSec,
-      endSec: clip.endSec,
-    });
-  }
-  if (clips.length === 1) {
-    clip2RenderSec = 0;
-  }
-
-  await persistPipelineStage(jobId, "clips_rendered");
-
-  return {
-    pendingResult: {
-      jobId,
-      preset,
-      clips: results,
-      scanInfo: {
-        partialScan: budget.capped,
-        minutesScanned: budget.effectiveScanMinutes,
-        videoDurationMinutes: durationMin,
-      },
-    },
-    clip1RenderSec,
-    clip2RenderSec,
-  };
-}
-
-async function runFinalizeStage(params: {
-  jobId: string;
-  userId: string;
-  budget: ProcessingBudget;
-  pendingResult: Omit<ProcessResponse, "usage">;
-}): Promise<number> {
-  const { jobId, userId, budget, pendingResult } = params;
-
-  const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
-  if (pendingResult.clips.length > 0) {
-    console.log(
-      `[Job ${jobId}] Remaining minutes after job: ${updatedUsage.minutesRemaining.toFixed(2)}`
-    );
-  }
-
-  const result: ProcessResponse = {
-    ...pendingResult,
-    usage: {
-      minutesUsed: updatedUsage.minutesUsed,
-      minutesLimit: updatedUsage.minutesLimit,
-      minutesRemaining: updatedUsage.minutesRemaining,
-    },
-  };
-
-  const latest = await readJobRecord(jobId);
-  if (!latest) return 0;
-
-  const tSave = performance.now();
-  await writeJobRecord(
-    patchJobRecord(latest, {
-      status: "completed",
-      result,
-      stage: "finalized",
-    })
-  );
-  return (performance.now() - tSave) / 1000;
-}
-
 export interface RunProcessJobParams {
   jobId: string;
   userId: string;
@@ -301,7 +54,7 @@ export interface RunProcessJobParams {
 }
 
 /**
- * Runs the full extract → transcribe → segment → render pipeline in explicit stages.
+ * Runs the full pipeline using lib/stages/* with per-stage leases (noop on single-box).
  * Expects job status "processing" (set by tryClaimJob). Updates job state to completed | failed.
  * Always releases claim.lock in finally when invoked after a successful claim.
  */
@@ -315,6 +68,8 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
   let clip1RenderSec: number | undefined;
   let clip2RenderSec: number | undefined;
   let finalSaveSec: number | undefined;
+
+  const leaseBackend = createNoopLeaseBackend();
 
   try {
     const existing = await readJobRecord(jobId);
@@ -368,46 +123,81 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
       const audioPath = path.join(jobDir, "audio.wav");
       const transcriptPath = path.join(jobDir, "transcript.json");
 
-      const et = await runExtractAndTranscribeStage({
-        jobId,
-        scriptPath,
-        videoPath,
-        audioPath,
-        transcriptPath,
-        extractOpts,
-        claimedAtMs,
-      });
-      claimToProcessingStartSec = et.claimToProcessingStartSec;
-      extractSec = et.result.extractSec;
-      transcribeSec = et.result.transcribeSec;
+      const transcribeLease = await leaseBackend.tryAcquire(jobId, "transcribe");
+      if (!transcribeLease) {
+        throw new Error("Could not acquire transcribe lease.");
+      }
+      let et;
+      try {
+        et = await runExtractAndTranscribeStage({
+          jobId,
+          scriptPath,
+          videoPath,
+          audioPath,
+          transcriptPath,
+          extractOpts,
+          claimedAtMs,
+        });
+        claimToProcessingStartSec = et.claimToProcessingStartSec;
+        extractSec = et.result.extractSec;
+        transcribeSec = et.result.transcribeSec;
+      } finally {
+        await transcribeLease.release();
+      }
 
-      const ms = await runMomentSelectionStage({
-        jobId,
-        platform,
-        goal,
-        transcript: et.result.transcript,
-      });
-      momentSelectionSec = ms.momentSelectionSec;
+      const momentLease = await leaseBackend.tryAcquire(jobId, "moment_selection");
+      if (!momentLease) {
+        throw new Error("Could not acquire moment_selection lease.");
+      }
+      let ms;
+      try {
+        ms = await runMomentSelectionStage({
+          jobId,
+          platform,
+          goal,
+          transcript: et.result.transcript,
+        });
+        momentSelectionSec = ms.momentSelectionSec;
+      } finally {
+        await momentLease.release();
+      }
 
-      const cr = await runClipRenderStage({
-        jobId,
-        videoPath,
-        jobDir,
-        outputDir,
-        preset: ms.preset,
-        clips: ms.clips,
-        budget,
-        durationMin,
-      });
-      clip1RenderSec = cr.clip1RenderSec;
-      clip2RenderSec = cr.clip2RenderSec;
+      const renderLease = await leaseBackend.tryAcquire(jobId, "render");
+      if (!renderLease) {
+        throw new Error("Could not acquire render lease.");
+      }
+      let cr;
+      try {
+        cr = await runClipRenderStage({
+          jobId,
+          videoPath,
+          jobDir,
+          outputDir,
+          preset: ms.preset,
+          clips: ms.clips,
+          budget,
+          durationMin,
+        });
+        clip1RenderSec = cr.clip1RenderSec;
+        clip2RenderSec = cr.clip2RenderSec;
+      } finally {
+        await renderLease.release();
+      }
 
-      finalSaveSec = await runFinalizeStage({
-        jobId,
-        userId,
-        budget,
-        pendingResult: cr.pendingResult,
-      });
+      const finalizeLease = await leaseBackend.tryAcquire(jobId, "finalize");
+      if (!finalizeLease) {
+        throw new Error("Could not acquire finalize lease.");
+      }
+      try {
+        finalSaveSec = await runFinalizeStage({
+          jobId,
+          userId,
+          budget,
+          pendingResult: cr.pendingResult,
+        });
+      } finally {
+        await finalizeLease.release();
+      }
     } catch (err: unknown) {
       const message = normalizeProcessError(err);
       console.error(`[Job ${jobId}] Process error:`, err);
