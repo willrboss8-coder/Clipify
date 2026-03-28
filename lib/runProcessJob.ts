@@ -18,6 +18,7 @@ import {
   type StageLeaseBackend,
 } from "@/lib/pipeline";
 import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
+import { logE2E } from "@/lib/e2e-timing";
 
 function logPipelineTiming(
   jobId: string,
@@ -101,6 +102,8 @@ async function executePostTranscribeStages(params: {
     outputDir,
     leaseBackend,
   } = params;
+
+  logE2E(jobId, "post_transcribe_started");
 
   const momentLease = await leaseBackend.tryAcquire(jobId, "moment_selection");
   if (!momentLease) {
@@ -247,6 +250,7 @@ export async function runTranscribeWorkerJob(
       claimToProcessingStartSec = et.claimToProcessingStartSec;
       extractSec = et.result.extractSec;
       transcribeSec = et.result.transcribeSec;
+      logE2E(jobId, "transcribe_finished");
     } catch (err: unknown) {
       const message = normalizeProcessError(err);
       console.error(`[Job ${jobId}] Transcribe worker error:`, err);
@@ -455,6 +459,7 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
     const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
 
     try {
+      logE2E(jobId, "main_worker_claimed", { pipeline: "unified" });
       const durationSec = await getVideoDuration(videoPath);
       if (!Number.isFinite(durationSec) || durationSec <= 0) {
         throw new Error("Could not read video duration.");
@@ -504,6 +509,8 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
       } finally {
         await transcribeLease.release();
       }
+
+      logE2E(jobId, "transcribe_finished");
 
       const post = await executePostTranscribeStages({
         jobId,

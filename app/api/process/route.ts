@@ -10,6 +10,7 @@ import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 import { writeJobRecord } from "@/lib/jobStore";
 import type { JobRecord } from "@/lib/types/clip-job";
+import { logE2E } from "@/lib/e2e-timing";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -54,6 +55,7 @@ export async function POST(req: NextRequest) {
     }
 
     const jobId = uuid();
+    logE2E(jobId, "request_received");
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
     const outputDir = path.join(ROOT, "outputs", jobId);
@@ -108,6 +110,7 @@ export async function POST(req: NextRequest) {
       goal,
     };
     await writeJobRecord(record);
+    logE2E(jobId, "job_enqueued");
 
     return NextResponse.json(
       {

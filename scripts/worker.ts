@@ -16,6 +16,7 @@ import {
   runProcessJobFromMomentSelection,
   isPipelineSplitTranscribe,
 } from "@/lib/runProcessJob";
+import { logE2E } from "@/lib/e2e-timing";
 import type { JobRecord } from "@/lib/types/clip-job";
 
 const UUID_RE =
@@ -88,6 +89,7 @@ async function tick(ROOT: string): Promise<void> {
       if (rec.status !== "processing" || rec.stage !== "transcribed") continue;
       const claimedAtMs = Date.now();
       console.log(`[Worker] Post-transcribe pipeline for job ${id}`);
+      logE2E(id, "post_transcribe_worker_started");
       await runProcessJobFromMomentSelection({
         jobId: id,
         userId: rec.userId,

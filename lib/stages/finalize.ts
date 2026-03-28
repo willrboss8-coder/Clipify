@@ -1,3 +1,4 @@
+import { logE2E } from "@/lib/e2e-timing";
 import { recordUsage, type ProcessingBudget } from "@/lib/usage";
 import { readJobRecord, writeJobRecord, patchJobRecord } from "@/lib/jobStore";
 import type { ProcessResponse } from "@/lib/types/clip-job";
@@ -37,5 +38,6 @@ export async function runFinalizeStage(params: {
       stage: "finalized",
     })
   );
+  logE2E(jobId, "render_finalize_finished");
   return (performance.now() - tSave) / 1000;
 }

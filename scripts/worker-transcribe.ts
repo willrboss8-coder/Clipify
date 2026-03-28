@@ -13,6 +13,7 @@ import { readJobRecord } from "@/lib/jobStore";
 import { tryClaimJob, releaseClaim } from "@/lib/jobClaim";
 import { getNextStageWorkerKind } from "@/lib/pipeline";
 import { runTranscribeWorkerJob } from "@/lib/runProcessJob";
+import { logE2E } from "@/lib/e2e-timing";
 import type { JobRecord } from "@/lib/types/clip-job";
 
 const UUID_RE =
@@ -89,6 +90,7 @@ async function tick(ROOT: string): Promise<void> {
 
     const claimedAtMs = Date.now();
     console.log(`[Transcribe-worker] Claimed job ${id} (transcribe stage)`);
+    logE2E(id, "transcribe_worker_claimed");
     await runTranscribeWorkerJob({
       jobId: id,
       userId: after.userId,

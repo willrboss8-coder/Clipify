@@ -1,6 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import { readJobRecord } from "@/lib/jobStore";
+import { logE2EApiPollCompleted } from "@/lib/e2e-timing";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,6 +30,10 @@ export async function GET(
 
   if (record.userId !== userId) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  if (record.status === "completed") {
+    logE2EApiPollCompleted(jobId);
   }
 
   return NextResponse.json(
