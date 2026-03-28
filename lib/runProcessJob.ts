@@ -11,6 +11,36 @@ import { releaseClaim } from "@/lib/jobClaim";
 import { normalizeProcessError } from "@/lib/process-job-errors";
 import type { ProcessResponse } from "@/lib/types/clip-job";
 
+function logPipelineTiming(
+  jobId: string,
+  fields: {
+    totalSec: number;
+    claimToProcessingStartSec?: number;
+    extractSec?: number;
+    transcribeSec?: number;
+    momentSelectionSec?: number;
+    clip1RenderSec?: number;
+    clip2RenderSec?: number;
+    finalSaveSec?: number;
+  }
+): void {
+  const parts: string[] = [
+    `jobId=${jobId}`,
+    `totalSec=${fields.totalSec.toFixed(3)}`,
+  ];
+  const add = (k: string, v: number | undefined) => {
+    if (v !== undefined) parts.push(`${k}=${v.toFixed(3)}`);
+  };
+  add("claimToProcessingStartSec", fields.claimToProcessingStartSec);
+  add("extractSec", fields.extractSec);
+  add("transcribeSec", fields.transcribeSec);
+  add("momentSelectionSec", fields.momentSelectionSec);
+  add("clip1RenderSec", fields.clip1RenderSec);
+  add("clip2RenderSec", fields.clip2RenderSec);
+  add("finalSaveSec", fields.finalSaveSec);
+  console.log(`[Job ${jobId}] timing ${parts.join(" ")}`);
+}
+
 function pythonExecutable(): string {
   return process.env.PYTHON_PATH?.trim() || "python3";
 }
@@ -39,6 +69,8 @@ export interface RunProcessJobParams {
   ROOT: string;
   platform: string;
   goal: string;
+  /** `Date.now()` when the worker successfully claimed this job (for claim→pipeline delay). */
+  claimedAtMs: number;
 }
 
 /**
@@ -47,7 +79,15 @@ export interface RunProcessJobParams {
  * Always releases claim.lock in finally when invoked after a successful claim.
  */
 export async function runProcessJob(params: RunProcessJobParams): Promise<void> {
-  const { jobId, userId, ROOT, platform, goal } = params;
+  const { jobId, userId, ROOT, platform, goal, claimedAtMs } = params;
+  const jobStartMs = Date.now();
+  let claimToProcessingStartSec: number | undefined;
+  let extractSec: number | undefined;
+  let transcribeSec: number | undefined;
+  let momentSelectionSec: number | undefined;
+  let clip1RenderSec: number | undefined;
+  let clip2RenderSec: number | undefined;
+  let finalSaveSec: number | undefined;
 
   try {
     const existing = await readJobRecord(jobId);
@@ -59,9 +99,11 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
     const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
     if (!existsSync(scriptPath)) {
       const msg = `Transcription script missing at ${scriptPath}`;
+      const tSave = performance.now();
       await writeJobRecord(
         patchJobRecord(existing, { status: "failed", error: msg })
       );
+      finalSaveSec = (performance.now() - tSave) / 1000;
       return;
     }
 
@@ -97,25 +139,42 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
           : undefined;
 
       const audioPath = path.join(jobDir, "audio.wav");
-      await extractAudio(videoPath, audioPath, extractOpts);
-
-      const transcriptPath = path.join(jobDir, "transcript.json");
-      await runPython(scriptPath, [audioPath, transcriptPath]);
-
-      const transcriptRaw = await readFile(transcriptPath, "utf-8");
-      let transcript: Transcript;
-      try {
-        transcript = JSON.parse(transcriptRaw) as Transcript;
-      } catch {
-        throw new Error("Transcription produced invalid JSON.");
+      claimToProcessingStartSec = (Date.now() - claimedAtMs) / 1000;
+      {
+        const t0 = performance.now();
+        await extractAudio(videoPath, audioPath, extractOpts);
+        extractSec = (performance.now() - t0) / 1000;
       }
 
-      const preset = getPreset(platform, goal);
-      const clips = findBestMoments(transcript, preset);
+      const transcriptPath = path.join(jobDir, "transcript.json");
+      let transcript: Transcript;
+      {
+        const t0 = performance.now();
+        await runPython(scriptPath, [audioPath, transcriptPath]);
+
+        const transcriptRaw = await readFile(transcriptPath, "utf-8");
+        try {
+          transcript = JSON.parse(transcriptRaw) as Transcript;
+        } catch {
+          throw new Error("Transcription produced invalid JSON.");
+        }
+        transcribeSec = (performance.now() - t0) / 1000;
+      }
+
+      let preset: ReturnType<typeof getPreset>;
+      let clips: ReturnType<typeof findBestMoments>;
+      {
+        const t0 = performance.now();
+        preset = getPreset(platform, goal);
+        clips = findBestMoments(transcript, preset);
+        momentSelectionSec = (performance.now() - t0) / 1000;
+      }
 
       let result: ProcessResponse;
 
       if (clips.length === 0) {
+        clip1RenderSec = 0;
+        clip2RenderSec = 0;
         const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
         result = {
           jobId,
@@ -147,7 +206,13 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
           const outputSrt = path.join(outputDir, `clip_${clipNum}.srt`);
           await copyFile(srtPath, outputSrt);
 
-          await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
+          {
+            const tCut = performance.now();
+            await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
+            const dur = (performance.now() - tCut) / 1000;
+            if (i === 0) clip1RenderSec = dur;
+            else clip2RenderSec = dur;
+          }
 
           results.push({
             clipUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.mp4`,
@@ -156,7 +221,10 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
             confidence: clip.confidence,
             startSec: clip.startSec,
             endSec: clip.endSec,
-          });
+          }        );
+        }
+        if (clips.length === 1) {
+          clip2RenderSec = 0;
         }
 
         const updatedUsage = await recordUsage(userId, budget.effectiveScanMinutes);
@@ -183,19 +251,38 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
 
       const latest = await readJobRecord(jobId);
       if (!latest) return;
-      await writeJobRecord(
-        patchJobRecord(latest, { status: "completed", result })
-      );
+      {
+        const tSave = performance.now();
+        await writeJobRecord(
+          patchJobRecord(latest, { status: "completed", result })
+        );
+        finalSaveSec = (performance.now() - tSave) / 1000;
+      }
     } catch (err: unknown) {
       const message = normalizeProcessError(err);
       console.error(`[Job ${jobId}] Process error:`, err);
       const latest = await readJobRecord(jobId);
       if (!latest) return;
-      await writeJobRecord(
-        patchJobRecord(latest, { status: "failed", error: message })
-      );
+      {
+        const tSave = performance.now();
+        await writeJobRecord(
+          patchJobRecord(latest, { status: "failed", error: message })
+        );
+        finalSaveSec = (performance.now() - tSave) / 1000;
+      }
     }
   } finally {
+    const totalSec = (Date.now() - jobStartMs) / 1000;
+    logPipelineTiming(jobId, {
+      totalSec,
+      claimToProcessingStartSec,
+      extractSec,
+      transcribeSec,
+      momentSelectionSec,
+      clip1RenderSec,
+      clip2RenderSec,
+      finalSaveSec,
+    });
     await releaseClaim(jobId).catch(() => {});
   }
 }

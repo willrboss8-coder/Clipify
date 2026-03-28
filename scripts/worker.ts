@@ -81,6 +81,7 @@ async function tick(ROOT: string): Promise<void> {
     const claimed = await tryClaimJob(id);
     if (!claimed) continue;
 
+    const claimedAtMs = Date.now();
     console.log(`[Worker] Claimed job ${id}`);
     await runProcessJob({
       jobId: id,
@@ -88,6 +89,7 @@ async function tick(ROOT: string): Promise<void> {
       ROOT,
       platform: rec.platform,
       goal: rec.goal,
+      claimedAtMs,
     });
   }
 }
