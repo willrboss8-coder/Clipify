@@ -60,11 +60,31 @@ function formatPlanMinutesForCopy(minutes: number): string {
 const SESSION_EXPIRED_COPY =
   "Your session expired. Please sign in again.";
 
+/** Client-side E2E timing (Generate Clip); anchor `t0` is first log in the flow. */
+function logUiE2e(
+  phase: string,
+  t0: number,
+  jobId?: string
+): void {
+  const elapsedMs = Date.now() - t0;
+  if (jobId) {
+    console.log(
+      `[UI E2E] jobId=${jobId} phase=${phase} elapsedMs=${elapsedMs}`
+    );
+  } else {
+    console.log(`[UI E2E] phase=${phase} elapsedMs=${elapsedMs}`);
+  }
+}
+
 /** Poll background job until completed or failed (long videos; HTTP request no longer blocks). */
 const JOB_POLL_INTERVAL_MS = 2500;
 const JOB_POLL_MAX_MS = 2 * 60 * 60 * 1000;
 
-async function pollJobUntilComplete(jobId: string): Promise<ProcessResponse> {
+async function pollJobUntilComplete(
+  jobId: string,
+  uiE2eT0: number
+): Promise<ProcessResponse> {
+  logUiE2e("polling_started", uiE2eT0, jobId);
   const deadline = Date.now() + JOB_POLL_MAX_MS;
   while (Date.now() < deadline) {
     const r = await fetch(`/api/jobs/${jobId}`, {
@@ -86,6 +106,7 @@ async function pollJobUntilComplete(jobId: string): Promise<ProcessResponse> {
       error?: string;
     };
     if (data.status === "completed" && data.result) {
+      logUiE2e("first_completed_status_seen", uiE2eT0, jobId);
       return data.result;
     }
     if (data.status === "failed") {
@@ -787,6 +808,9 @@ export default function HomePage() {
     setStatus(null);
     setStatusIdx(-1);
 
+    const uiE2eT0 = Date.now();
+    logUiE2e("generate_click", uiE2eT0);
+
     try {
       let sessionOk = await refreshClerkSessionForUpload(getToken);
       if (!sessionOk) {
@@ -812,6 +836,7 @@ export default function HomePage() {
             body: buildForm(),
           });
 
+        logUiE2e("upload_request_started", uiE2eT0);
         let res = await postProcess();
         if (res.status === 401) {
           sessionOk = await refreshClerkSessionForUpload(getToken);
@@ -860,7 +885,9 @@ export default function HomePage() {
           throw new Error("Server did not return a job id.");
         }
 
-        const data = await pollJobUntilComplete(jobId);
+        logUiE2e("upload_response_received", uiE2eT0, jobId);
+
+        const data = await pollJobUntilComplete(jobId, uiE2eT0);
 
         if (
           typeof data.jobId !== "string" ||
@@ -894,6 +921,11 @@ export default function HomePage() {
         setSeenClipHistory(initialHistory);
         setStatusIdx(STATUS_STEPS.length - 1);
         setStatus("Done");
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            logUiE2e("result_rendered", uiE2eT0, data.jobId);
+          });
+        });
       } finally {
         cancel();
       }
