@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
-import { isClerkAuthDebugEnabled, logClerkAuthDebug } from "@/lib/clerk-auth-debug";
+import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 
 const isPublicRoute = createRouteMatcher([
   "/sign-in(.*)",
@@ -44,8 +44,9 @@ export default clerkMiddleware(
     const parties = process.env.CLERK_AUTHORIZED_PARTIES?.split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const debug = process.env.NODE_ENV !== "production";
     return {
-      ...(isClerkAuthDebugEnabled() ? { debug: true as const } : {}),
+      ...(debug ? { debug } : {}),
       ...(parties?.length ? { authorizedParties: parties } : {}),
     };
   }

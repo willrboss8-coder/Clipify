@@ -1,7 +1,8 @@
 import type { NextRequest } from "next/server";
 
-/** Set to `1` or `true` on Render temporarily; remove after fixing auth. */
+/** Local-only: set `CLERK_AUTH_DEBUG=1` (ignored when NODE_ENV is production). */
 export function isClerkAuthDebugEnabled(): boolean {
+  if (process.env.NODE_ENV === "production") return false;
   const v = process.env.CLERK_AUTH_DEBUG;
   return v === "1" || v === "true";
 }
