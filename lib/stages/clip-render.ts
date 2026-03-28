@@ -1,6 +1,6 @@
 import path from "path";
 import { copyFile } from "fs/promises";
-import { cutClip } from "@/lib/ffmpeg";
+import { cutClip, getVideoDimensions } from "@/lib/ffmpeg";
 import { findBestMoments, getPreset } from "@/lib/segmenter";
 import { writeSrt } from "@/lib/srt";
 import type { ProcessingBudget } from "@/lib/usage";
@@ -51,6 +51,8 @@ export async function runClipRenderStage(params: {
   let clip1RenderSec = 0;
   let clip2RenderSec = 0;
 
+  const sourceDimensions = await getVideoDimensions(videoPath);
+
   for (let i = 0; i < Math.min(clips.length, 2); i++) {
     const clip = clips[i];
     const clipNum = i + 1;
@@ -64,7 +66,13 @@ export async function runClipRenderStage(params: {
 
     {
       const tCut = performance.now();
-      await cutClip(videoPath, clip.startSec, clip.endSec, clipPath);
+      await cutClip(
+        videoPath,
+        clip.startSec,
+        clip.endSec,
+        clipPath,
+        sourceDimensions
+      );
       const dur = (performance.now() - tCut) / 1000;
       if (i === 0) clip1RenderSec = dur;
       else clip2RenderSec = dur;

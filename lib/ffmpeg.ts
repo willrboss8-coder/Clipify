@@ -84,10 +84,13 @@ export async function cutClip(
   videoPath: string,
   start: number,
   end: number,
-  outputPath: string
+  outputPath: string,
+  /** When set (e.g. from a single ffprobe per job), skips getVideoDimensions for this call. */
+  sourceDimensions?: { width: number; height: number }
 ): Promise<void> {
   const duration = end - start;
-  const { width, height } = await getVideoDimensions(videoPath);
+  const { width, height } =
+    sourceDimensions ?? (await getVideoDimensions(videoPath));
 
   const targetW = 720;
   const targetH = 1280;
