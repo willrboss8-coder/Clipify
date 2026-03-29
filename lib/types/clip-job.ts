@@ -33,7 +33,12 @@ export interface ProcessResponse {
   };
 }
 
-export type JobStatus = "queued" | "processing" | "completed" | "failed";
+export type JobStatus =
+  | "awaiting_upload"
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed";
 
 /**
  * Internal pipeline progress (persisted for staged-worker foundation).

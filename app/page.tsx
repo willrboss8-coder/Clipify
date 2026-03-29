@@ -112,6 +112,10 @@ async function pollJobUntilComplete(
     if (data.status === "failed") {
       throw new Error(data.error || "Processing failed");
     }
+    if (data.status === "awaiting_upload") {
+      await new Promise((res) => setTimeout(res, JOB_POLL_INTERVAL_MS));
+      continue;
+    }
     await new Promise((res) => setTimeout(res, JOB_POLL_INTERVAL_MS));
   }
   throw new Error(
@@ -121,7 +125,7 @@ async function pollJobUntilComplete(
 
 /**
  * Clerk can refresh an expired JWT on GET, not on POST (`session-token-expired-refresh-non-eligible-non-get`).
- * Force a fresh token, then hit a lightweight GET so cookies/session are valid before multipart POST /api/process.
+ * Force a fresh token, then hit a lightweight GET so cookies/session are valid before POST /api/process/init and multipart POST /api/process/upload.
  */
 function messageForFailedProcessResponse(
   res: Response,
@@ -821,27 +825,84 @@ export default function HomePage() {
 
       const cancel = simulateProgress();
       try {
-        const buildForm = () => {
+        const postInit = () =>
+          fetch("/api/process/init", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ platform, goal }),
+          });
+
+        let initRes = await postInit();
+        if (initRes.status === 401) {
+          sessionOk = await refreshClerkSessionForUpload(getToken);
+          if (sessionOk) {
+            initRes = await postInit();
+          }
+        }
+        if (initRes.status === 401) {
+          setError(SESSION_EXPIRED_COPY);
+          redirectToSignIn({ redirectUrl: window.location.href });
+          return;
+        }
+
+        const initRaw = await initRes.text();
+        let initParsed: Record<string, unknown>;
+        try {
+          initParsed = JSON.parse(initRaw) as Record<string, unknown>;
+        } catch {
+          throw new Error(
+            messageForFailedProcessResponse(initRes, initRaw, true)
+          );
+        }
+
+        if (!initRes.ok) {
+          const errText =
+            typeof initParsed.error === "string" && initParsed.error
+              ? initParsed.error
+              : messageForFailedProcessResponse(initRes, initRaw);
+          if (initRes.status === 401 || /unauthorized/i.test(errText)) {
+            setError(SESSION_EXPIRED_COPY);
+            redirectToSignIn({ redirectUrl: window.location.href });
+            return;
+          }
+          throw new Error(errText);
+        }
+
+        if (initRes.status !== 202) {
+          throw new Error(
+            "Unexpected response from server. Try again or update the app."
+          );
+        }
+
+        const jobId =
+          typeof initParsed.jobId === "string" ? initParsed.jobId : "";
+        if (!jobId) {
+          throw new Error("Server did not return a job id.");
+        }
+
+        logUiE2e("init_response_received", uiE2eT0, jobId);
+
+        const buildUploadForm = () => {
           const form = new FormData();
           form.append("file", file);
-          form.append("platform", platform);
-          form.append("goal", goal);
+          form.append("jobId", jobId);
           return form;
         };
 
-        const postProcess = () =>
-          fetch("/api/process", {
+        const postUpload = () =>
+          fetch("/api/process/upload", {
             method: "POST",
             credentials: "include",
-            body: buildForm(),
+            body: buildUploadForm(),
           });
 
-        logUiE2e("upload_request_started", uiE2eT0);
-        let res = await postProcess();
+        logUiE2e("upload_request_started", uiE2eT0, jobId);
+        let res = await postUpload();
         if (res.status === 401) {
           sessionOk = await refreshClerkSessionForUpload(getToken);
           if (sessionOk) {
-            res = await postProcess();
+            res = await postUpload();
           }
         }
         if (res.status === 401) {
@@ -879,10 +940,10 @@ export default function HomePage() {
           );
         }
 
-        const jobId =
+        const uploadJobId =
           typeof parsed.jobId === "string" ? parsed.jobId : "";
-        if (!jobId) {
-          throw new Error("Server did not return a job id.");
+        if (!uploadJobId || uploadJobId !== jobId) {
+          throw new Error("Server did not return a consistent job id.");
         }
 
         logUiE2e("upload_response_received", uiE2eT0, jobId);

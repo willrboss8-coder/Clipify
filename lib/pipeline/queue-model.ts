@@ -26,6 +26,9 @@ export function getNextStageWorkerKind(record: JobRecord): StageWorkerKind | nul
   if (record.status === "failed" || record.status === "completed") {
     return null;
   }
+  if (record.status === "awaiting_upload") {
+    return null;
+  }
   if (record.status === "queued") {
     return null;
   }

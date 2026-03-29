@@ -1,22 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
-import { mkdir, writeFile } from "fs/promises";
+import { writeFile } from "fs/promises";
 import path from "path";
-import { v4 as uuid } from "uuid";
 import { auth } from "@clerk/nextjs/server";
 import { getVideoDuration } from "@/lib/ffmpeg";
 import { getProcessingBudget } from "@/lib/usage";
 import { getStorageRoot } from "@/lib/storage-path";
 import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
-import { writeJobRecord } from "@/lib/jobStore";
+import { readJobRecord, writeJobRecord, patchJobRecord } from "@/lib/jobStore";
 import type { JobRecord } from "@/lib/types/clip-job";
 import { logE2E } from "@/lib/e2e-timing";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** Upload + ffprobe + budget only; heavy work runs in the worker process (see scripts/worker.ts). */
-export const maxDuration = 120;
+/** Multipart upload + ffprobe + budget; transitions job to queued. */
+export const maxDuration = 600;
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function jsonError(message: string, status: number) {
   const safe = message.slice(0, 2000);
@@ -29,24 +31,20 @@ function jsonError(message: string, status: number) {
   );
 }
 
+async function failJob(rec: JobRecord, error: string): Promise<void> {
+  await writeJobRecord(
+    patchJobRecord(rec, { status: "failed", error: error.slice(0, 2000) })
+  );
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { userId } = await auth();
-    logClerkAuthDebug("api/process:POST", req, { userId });
+    logClerkAuthDebug("api/process/upload:POST", req, { userId });
     if (!userId) {
       return jsonError("Unauthorized", 401);
     }
 
-    const formData = await req.formData();
-    const file = formData.get("file") as File | null;
-    const platform = (formData.get("platform") as string) || "tiktok";
-    const goal = (formData.get("goal") as string) || "default";
-
-    if (!file) {
-      return jsonError("No file uploaded", 400);
-    }
-
-    const ROOT = getStorageRoot();
     if (!hasTranscriptionScript()) {
       return jsonError(
         "Transcription scripts missing (expected scripts/transcribe_daemon.py or scripts/transcribe.py). Ensure the app is deployed (scripts/ included).",
@@ -54,22 +52,42 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const jobId = uuid();
-    logE2E(jobId, "request_received");
-    const uploadsDir = path.join(ROOT, "uploads");
-    const jobDir = path.join(ROOT, "jobs", jobId);
-    const outputDir = path.join(ROOT, "outputs", jobId);
+    const formData = await req.formData();
+    const file = formData.get("file") as File | null;
+    const jobIdRaw = formData.get("jobId");
+    const jobId =
+      typeof jobIdRaw === "string" ? jobIdRaw.trim() : "";
 
-    await mkdir(uploadsDir, { recursive: true });
-    await mkdir(jobDir, { recursive: true });
-    await mkdir(outputDir, { recursive: true });
+    if (!file) {
+      return jsonError("No file uploaded", 400);
+    }
+    if (!jobId || !UUID_RE.test(jobId)) {
+      return jsonError("Missing or invalid jobId", 400);
+    }
 
-    const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
+    const rec = await readJobRecord(jobId);
+    if (!rec) {
+      return jsonError("Job not found", 404);
+    }
+    if (rec.userId !== userId) {
+      return jsonError("Not found", 404);
+    }
+    if (rec.status !== "awaiting_upload") {
+      return jsonError(
+        "Job is not waiting for upload (wrong status or upload already completed).",
+        409
+      );
+    }
+
+    const ROOT = getStorageRoot();
+    const videoPath = path.join(ROOT, "uploads", `${jobId}.mp4`);
+
     const buffer = Buffer.from(await file.arrayBuffer());
     await writeFile(videoPath, buffer);
 
     const durationSec = await getVideoDuration(videoPath);
     if (!Number.isFinite(durationSec) || durationSec <= 0) {
+      await failJob(rec, "Could not read video duration. Try another file.");
       return jsonError("Could not read video duration. Try another file.", 400);
     }
     const durationMin = durationSec / 60;
@@ -85,6 +103,10 @@ export async function POST(req: NextRequest) {
     );
 
     if (!budget.allowed) {
+      await failJob(
+        rec,
+        budget.blockedMessage ?? "No minutes remaining this month."
+      );
       return NextResponse.json(
         {
           error: budget.blockedMessage ?? "No minutes remaining this month.",
@@ -99,17 +121,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const now = new Date().toISOString();
-    const record: JobRecord = {
-      jobId,
-      userId,
-      status: "queued",
-      createdAt: now,
-      updatedAt: now,
-      platform,
-      goal,
-    };
-    await writeJobRecord(record);
+    const latest = await readJobRecord(jobId);
+    if (!latest || latest.status !== "awaiting_upload") {
+      return jsonError("Job state changed; try again.", 409);
+    }
+
+    await writeJobRecord(
+      patchJobRecord(latest, {
+        status: "queued",
+      })
+    );
     logE2E(jobId, "job_enqueued");
 
     return NextResponse.json(
@@ -126,8 +147,8 @@ export async function POST(req: NextRequest) {
     );
   } catch (err: unknown) {
     const message =
-      err instanceof Error ? err.message : "Failed to enqueue processing job";
-    console.error("Process enqueue error:", err);
+      err instanceof Error ? err.message : "Failed to upload processing job";
+    console.error("Process upload error:", err);
     return jsonError(message, 500);
   }
 }

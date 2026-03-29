@@ -46,7 +46,8 @@ No extra npm packages are required (`fetch` only). Multi-speaker labels are **no
 
 ```
 app/page.tsx                    — Main UI (upload, settings, results)
-app/api/process/route.ts        — Processing pipeline API
+app/api/process/init/route.ts   — Create job (returns jobId before file upload)
+app/api/process/upload/route.ts — Upload video, ffprobe + budget, then queue job
 app/api/files/[...path]/route.ts — File serving for generated clips
 lib/ffmpeg.ts                   — FFmpeg wrapper utilities
 lib/segmenter.ts                — Viral moment detection algorithm
