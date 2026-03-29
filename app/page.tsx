@@ -1,6 +1,13 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect, type DragEvent } from "react";
+import {
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  type DragEvent,
+  type MutableRefObject,
+} from "react";
 import { useUser, UserButton, useAuth, useClerk } from "@clerk/nextjs";
 import { PRO_POSITIONING, POWER_POSITIONING } from "@/lib/plans";
 import type { ViralCaptionAccess } from "@/lib/viral-captions";
@@ -74,6 +81,72 @@ function logUiE2e(
   } else {
     console.log(`[UI E2E] phase=${phase} elapsedMs=${elapsedMs}`);
   }
+}
+
+interface UploadProgressState {
+  loaded: number;
+  total: number;
+  percent: number;
+  etaSec: number | null;
+}
+
+function fmtBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Multipart POST with upload progress (fetch has no upload progress on request body).
+ */
+function postMultipartWithUploadProgress(
+  url: string,
+  formData: FormData,
+  opts: {
+    onProgress: (p: UploadProgressState) => void;
+    uploadStartMsRef: MutableRefObject<number>;
+  }
+): Promise<{ ok: boolean; status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        if (opts.uploadStartMsRef.current === 0) {
+          opts.uploadStartMsRef.current = Date.now();
+        }
+        const loaded = e.loaded;
+        const total = e.total;
+        const percent = Math.min(100, Math.round((loaded / total) * 100));
+        const elapsedSec = (Date.now() - opts.uploadStartMsRef.current) / 1000;
+        const rate = elapsedSec > 0 && loaded > 0 ? loaded / elapsedSec : 0;
+        const etaSec =
+          rate > 0 && total > loaded
+            ? Math.max(0, Math.round((total - loaded) / rate))
+            : null;
+        opts.onProgress({ loaded, total, percent, etaSec });
+      } else {
+        opts.onProgress({
+          loaded: e.loaded,
+          total: 0,
+          percent: 0,
+          etaSec: null,
+        });
+      }
+    };
+    xhr.onload = () => {
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        body: xhr.responseText,
+      });
+    };
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.onabort = () => reject(new Error("Upload aborted"));
+    xhr.send(formData);
+  });
 }
 
 /** Poll background job until completed or failed (long videos; HTTP request no longer blocks). */
@@ -181,6 +254,11 @@ export default function HomePage() {
   const [goal, setGoal] = useState<Goal>("growth");
   const [status, setStatus] = useState<string | null>(null);
   const [statusIdx, setStatusIdx] = useState(-1);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressState | null>(
+    null
+  );
+  const [isCreatingJob, setIsCreatingJob] = useState(false);
+  const uploadStartMsRef = useRef(0);
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -747,11 +825,12 @@ export default function HomePage() {
     if (f) setFile(f);
   };
 
-  const simulateProgress = () => {
+  /** Simulated backend steps. Use `startStepIndex = 1` after file upload so we don&apos;t show &quot;Uploading video&quot; again. */
+  const simulateProgress = (startStepIndex = 0) => {
     let cancelled = false;
-    let idx = 0;
-    setStatusIdx(0);
-    setStatus(STATUS_STEPS[0]);
+    let idx = startStepIndex;
+    setStatusIdx(startStepIndex);
+    setStatus(STATUS_STEPS[startStepIndex]);
 
     const advance = () => {
       if (cancelled) return;
@@ -768,7 +847,9 @@ export default function HomePage() {
     };
     advance();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   };
 
   const handleUpgrade = async (tier: "pro" | "power" = "pro") => {
@@ -823,8 +904,13 @@ export default function HomePage() {
         return;
       }
 
-      const cancel = simulateProgress();
+      let cancelSimulate: (() => void) | null = null;
       try {
+        setIsCreatingJob(true);
+        setStatus(null);
+        setStatusIdx(-1);
+        setUploadProgress(null);
+
         const postInit = () =>
           fetch("/api/process/init", {
             method: "POST",
@@ -841,6 +927,7 @@ export default function HomePage() {
           }
         }
         if (initRes.status === 401) {
+          setIsCreatingJob(false);
           setError(SESSION_EXPIRED_COPY);
           redirectToSignIn({ redirectUrl: window.location.href });
           return;
@@ -857,6 +944,7 @@ export default function HomePage() {
         }
 
         if (!initRes.ok) {
+          setIsCreatingJob(false);
           const errText =
             typeof initParsed.error === "string" && initParsed.error
               ? initParsed.error
@@ -870,6 +958,7 @@ export default function HomePage() {
         }
 
         if (initRes.status !== 202) {
+          setIsCreatingJob(false);
           throw new Error(
             "Unexpected response from server. Try again or update the app."
           );
@@ -878,9 +967,11 @@ export default function HomePage() {
         const jobId =
           typeof initParsed.jobId === "string" ? initParsed.jobId : "";
         if (!jobId) {
+          setIsCreatingJob(false);
           throw new Error("Server did not return a job id.");
         }
 
+        setIsCreatingJob(false);
         logUiE2e("init_response_received", uiE2eT0, jobId);
 
         const buildUploadForm = () => {
@@ -890,43 +981,66 @@ export default function HomePage() {
           return form;
         };
 
-        const postUpload = () =>
-          fetch("/api/process/upload", {
-            method: "POST",
-            credentials: "include",
-            body: buildUploadForm(),
-          });
+        uploadStartMsRef.current = 0;
+        setUploadProgress({
+          loaded: 0,
+          total: file.size,
+          percent: 0,
+          etaSec: null,
+        });
 
         logUiE2e("upload_request_started", uiE2eT0, jobId);
-        let res = await postUpload();
-        if (res.status === 401) {
+
+        const runUpload = () =>
+          postMultipartWithUploadProgress(
+            "/api/process/upload",
+            buildUploadForm(),
+            {
+              onProgress: (p) => setUploadProgress(p),
+              uploadStartMsRef,
+            }
+          );
+
+        let xhrRes = await runUpload();
+        if (xhrRes.status === 401) {
           sessionOk = await refreshClerkSessionForUpload(getToken);
           if (sessionOk) {
-            res = await postUpload();
+            uploadStartMsRef.current = 0;
+            setUploadProgress({
+              loaded: 0,
+              total: file.size,
+              percent: 0,
+              etaSec: null,
+            });
+            xhrRes = await runUpload();
           }
         }
-        if (res.status === 401) {
+        if (xhrRes.status === 401) {
+          setUploadProgress(null);
           setError(SESSION_EXPIRED_COPY);
           redirectToSignIn({ redirectUrl: window.location.href });
           return;
         }
 
-        const raw = await res.text();
+        const raw = xhrRes.body;
+        const fauxRes = new Response(raw, { status: xhrRes.status });
         let parsed: Record<string, unknown>;
         try {
           parsed = JSON.parse(raw) as Record<string, unknown>;
         } catch {
+          setUploadProgress(null);
           throw new Error(
-            messageForFailedProcessResponse(res, raw, true)
+            messageForFailedProcessResponse(fauxRes, raw, true)
           );
         }
 
-        if (!res.ok) {
+        if (!xhrRes.ok) {
+          setUploadProgress(null);
           const errText =
             typeof parsed.error === "string" && parsed.error
               ? parsed.error
-              : messageForFailedProcessResponse(res, raw);
-          if (res.status === 401 || /unauthorized/i.test(errText)) {
+              : messageForFailedProcessResponse(fauxRes, raw);
+          if (xhrRes.status === 401 || /unauthorized/i.test(errText)) {
             setError(SESSION_EXPIRED_COPY);
             redirectToSignIn({ redirectUrl: window.location.href });
             return;
@@ -934,7 +1048,8 @@ export default function HomePage() {
           throw new Error(errText);
         }
 
-        if (res.status !== 202) {
+        if (xhrRes.status !== 202) {
+          setUploadProgress(null);
           throw new Error(
             "Unexpected response from server. Try again or update the app."
           );
@@ -943,10 +1058,14 @@ export default function HomePage() {
         const uploadJobId =
           typeof parsed.jobId === "string" ? parsed.jobId : "";
         if (!uploadJobId || uploadJobId !== jobId) {
+          setUploadProgress(null);
           throw new Error("Server did not return a consistent job id.");
         }
 
+        setUploadProgress(null);
         logUiE2e("upload_response_received", uiE2eT0, jobId);
+
+        cancelSimulate = simulateProgress(1);
 
         const data = await pollJobUntilComplete(jobId, uiE2eT0);
 
@@ -988,7 +1107,9 @@ export default function HomePage() {
           });
         });
       } finally {
-        cancel();
+        cancelSimulate?.();
+        setUploadProgress(null);
+        setIsCreatingJob(false);
       }
     } catch (err: unknown) {
       const msg =
@@ -1004,8 +1125,9 @@ export default function HomePage() {
 
   const isProcessing =
     !error &&
-    statusIdx >= 0 &&
-    statusIdx < STATUS_STEPS.length - 1;
+    (isCreatingJob ||
+      uploadProgress !== null ||
+      (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
 
   return (
     <div className="min-h-screen">
@@ -1665,45 +1787,96 @@ export default function HomePage() {
                   className="w-full py-4 rounded-xl font-semibold text-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20"
                 >
                   {isProcessing
-                    ? "Processing..."
+                    ? uploadProgress
+                      ? "Uploading..."
+                      : isCreatingJob
+                        ? "Preparing..."
+                        : "Processing..."
                     : usage != null && usage.minutesRemaining <= 0
                       ? "No minutes remaining"
                       : "Generate Clips"}
                 </button>
 
-                {/* Status (show even when error is set so failure isn’t mistaken for a blank reset) */}
-                {status && !result && (
+                {/* Upload progress (real bytes); no fake pipeline steps here */}
+                {!result && (isCreatingJob || uploadProgress) && (
                   <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-5">
-                    <div className="space-y-2">
-                      {STATUS_STEPS.map((step, i) => (
-                        <div
-                          key={step}
-                          className={`flex items-center gap-3 text-sm transition-opacity ${
-                            i <= statusIdx ? "opacity-100" : "opacity-30"
-                          }`}
-                        >
+                    {isCreatingJob && !uploadProgress && (
+                      <p className="text-white font-medium">Creating job…</p>
+                    )}
+                    {uploadProgress && (
+                      <div className="space-y-3">
+                        <p className="text-white font-medium">Uploading video…</p>
+                        <div className="h-2.5 rounded-full bg-gray-800 overflow-hidden">
+                          <div
+                            className="h-full bg-gradient-to-r from-purple-600 to-pink-600 transition-[width] duration-150 ease-linear"
+                            style={{
+                              width: `${uploadProgress.percent}%`,
+                            }}
+                          />
+                        </div>
+                        <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm text-gray-300">
                           <span>
-                            {i < statusIdx ? (
-                              <span className="text-green-400">✓</span>
-                            ) : i === statusIdx ? (
-                              <span className="animate-pulse text-purple-400">●</span>
-                            ) : (
-                              <span className="text-gray-600">○</span>
+                            {uploadProgress.percent}%
+                            {uploadProgress.total > 0 && (
+                              <>
+                                {" "}
+                                <span className="text-gray-500">
+                                  ({fmtBytes(uploadProgress.loaded)} /{" "}
+                                  {fmtBytes(uploadProgress.total)})
+                                </span>
+                              </>
                             )}
                           </span>
-                          <span
-                            className={
-                              i === statusIdx
-                                ? "text-white font-medium"
-                                : i < statusIdx
-                                  ? "text-green-400"
-                                  : "text-gray-600"
-                            }
-                          >
-                            {step}
-                          </span>
+                          {uploadProgress.etaSec != null && uploadProgress.etaSec > 0 && (
+                            <span className="text-gray-500 text-xs">
+                              ~{uploadProgress.etaSec}s left
+                            </span>
+                          )}
                         </div>
-                      ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Backend pipeline (after upload only; simulated steps) */}
+                {status && !result && !uploadProgress && !isCreatingJob && (
+                  <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-5">
+                    <p className="text-xs text-gray-500 mb-3">
+                      Upload complete — processing on the server.
+                    </p>
+                    <div className="space-y-2">
+                      {STATUS_STEPS.slice(1).map((step, i) => {
+                        const stepIndex = i + 1;
+                        return (
+                          <div
+                            key={step}
+                            className={`flex items-center gap-3 text-sm transition-opacity ${
+                              stepIndex <= statusIdx ? "opacity-100" : "opacity-30"
+                            }`}
+                          >
+                            <span>
+                              {stepIndex < statusIdx ? (
+                                <span className="text-green-400">✓</span>
+                              ) : stepIndex === statusIdx ? (
+                                <span className="animate-pulse text-purple-400">●</span>
+                              ) : (
+                                <span className="text-gray-600">○</span>
+                              )}
+                            </span>
+                            <span
+                              className={
+                                stepIndex === statusIdx
+                                  ? "text-white font-medium"
+                                  : stepIndex < statusIdx
+                                    ? "text-green-400"
+                                    : "text-gray-600"
+                              }
+                            >
+                              {step}
+                            </span>
+                          </div>
+                        );
+                      })}
                     </div>
                     <p className="text-xs text-gray-500 mt-4">
                       This may take a moment, especially for longer videos.
