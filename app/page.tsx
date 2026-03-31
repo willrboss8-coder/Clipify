@@ -149,6 +149,60 @@ function postMultipartWithUploadProgress(
   });
 }
 
+/**
+ * PUT file to a presigned R2 URL (cross-origin; do not send cookies).
+ * Progress events mirror multipart upload.
+ */
+function putFileToPresignedUrlWithProgress(
+  uploadUrl: string,
+  file: File,
+  contentType: string,
+  opts: {
+    onProgress: (p: UploadProgressState) => void;
+    uploadStartMsRef: MutableRefObject<number>;
+  }
+): Promise<{ ok: boolean; status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", uploadUrl);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        if (opts.uploadStartMsRef.current === 0) {
+          opts.uploadStartMsRef.current = Date.now();
+        }
+        const loaded = e.loaded;
+        const total = e.total;
+        const percent = Math.min(100, Math.round((loaded / total) * 100));
+        const elapsedSec = (Date.now() - opts.uploadStartMsRef.current) / 1000;
+        const rate = elapsedSec > 0 && loaded > 0 ? loaded / elapsedSec : 0;
+        const etaSec =
+          rate > 0 && total > loaded
+            ? Math.max(0, Math.round((total - loaded) / rate))
+            : null;
+        opts.onProgress({ loaded, total, percent, etaSec });
+      } else {
+        opts.onProgress({
+          loaded: e.loaded,
+          total: file.size,
+          percent: 0,
+          etaSec: null,
+        });
+      }
+    };
+    xhr.onload = () => {
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        body: xhr.responseText,
+      });
+    };
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.onabort = () => reject(new Error("Upload aborted"));
+    xhr.setRequestHeader("Content-Type", contentType);
+    xhr.send(file);
+  });
+}
+
 /** Poll background job until completed or failed (long videos; HTTP request no longer blocks). */
 const JOB_POLL_INTERVAL_MS = 2500;
 const JOB_POLL_MAX_MS = 2 * 60 * 60 * 1000;
@@ -198,7 +252,7 @@ async function pollJobUntilComplete(
 
 /**
  * Clerk can refresh an expired JWT on GET, not on POST (`session-token-expired-refresh-non-eligible-non-get`).
- * Force a fresh token, then hit a lightweight GET so cookies/session are valid before POST /api/process/init and multipart POST /api/process/upload.
+ * Force a fresh token, then hit a lightweight GET so cookies/session are valid before POST /api/process/init and upload steps.
  */
 function messageForFailedProcessResponse(
   res: Response,
@@ -981,89 +1035,254 @@ export default function HomePage() {
           return form;
         };
 
-        uploadStartMsRef.current = 0;
-        setUploadProgress({
-          loaded: 0,
-          total: file.size,
-          percent: 0,
-          etaSec: null,
-        });
+        const postUploadUrl = () =>
+          fetch("/api/process/upload-url", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jobId }),
+          });
 
-        logUiE2e("upload_request_started", uiE2eT0, jobId);
-
-        const runUpload = () =>
-          postMultipartWithUploadProgress(
-            "/api/process/upload",
-            buildUploadForm(),
-            {
-              onProgress: (p) => setUploadProgress(p),
-              uploadStartMsRef,
-            }
+        let urlRes: Response;
+        try {
+          urlRes = await postUploadUrl();
+        } catch {
+          urlRes = new Response(
+            JSON.stringify({
+              error:
+                "Could not reach server for direct upload. Falling back to app upload.",
+            }),
+            { status: 503 }
           );
-
-        let xhrRes = await runUpload();
-        if (xhrRes.status === 401) {
+        }
+        if (urlRes.status === 401) {
           sessionOk = await refreshClerkSessionForUpload(getToken);
           if (sessionOk) {
-            uploadStartMsRef.current = 0;
-            setUploadProgress({
-              loaded: 0,
-              total: file.size,
-              percent: 0,
-              etaSec: null,
-            });
-            xhrRes = await runUpload();
+            try {
+              urlRes = await postUploadUrl();
+            } catch {
+              urlRes = new Response(
+                JSON.stringify({
+                  error:
+                    "Could not reach server for direct upload. Falling back to app upload.",
+                }),
+                { status: 503 }
+              );
+            }
           }
         }
-        if (xhrRes.status === 401) {
+        if (urlRes.status === 401) {
           setUploadProgress(null);
           setError(SESSION_EXPIRED_COPY);
           redirectToSignIn({ redirectUrl: window.location.href });
           return;
         }
 
-        const raw = xhrRes.body;
-        const fauxRes = new Response(raw, { status: xhrRes.status });
-        let parsed: Record<string, unknown>;
-        try {
-          parsed = JSON.parse(raw) as Record<string, unknown>;
-        } catch {
-          setUploadProgress(null);
-          throw new Error(
-            messageForFailedProcessResponse(fauxRes, raw, true)
-          );
+        const urlText = await urlRes.text();
+        let r2UploadUrl: string | null = null;
+        let r2ContentType = "video/mp4";
+        if (urlRes.ok && urlRes.status === 200) {
+          try {
+            const urlParsed = JSON.parse(urlText) as Record<string, unknown>;
+            if (
+              typeof urlParsed.uploadUrl === "string" &&
+              urlParsed.uploadUrl.length > 0
+            ) {
+              r2UploadUrl = urlParsed.uploadUrl;
+              if (typeof urlParsed.contentType === "string") {
+                r2ContentType = urlParsed.contentType;
+              }
+            }
+          } catch {
+            /* no presigned URL */
+          }
         }
 
-        if (!xhrRes.ok) {
+        if (r2UploadUrl == null) {
+          if (
+            urlRes.status === 400 ||
+            urlRes.status === 404 ||
+            urlRes.status === 409
+          ) {
+            setUploadProgress(null);
+            const fauxRes = new Response(urlText, { status: urlRes.status });
+            let parsedErr: Record<string, unknown>;
+            try {
+              parsedErr = JSON.parse(urlText) as Record<string, unknown>;
+            } catch {
+              throw new Error(
+                messageForFailedProcessResponse(fauxRes, urlText, true)
+              );
+            }
+            const errText =
+              typeof parsedErr.error === "string" && parsedErr.error
+                ? parsedErr.error
+                : messageForFailedProcessResponse(fauxRes, urlText);
+            if (/unauthorized/i.test(errText)) {
+              setError(SESSION_EXPIRED_COPY);
+              redirectToSignIn({ redirectUrl: window.location.href });
+              return;
+            }
+            throw new Error(errText);
+          }
+          logUiE2e("upload_multipart_fallback", uiE2eT0, jobId);
+        }
+
+        const finishQueuedResponse = (
+          raw: string,
+          status: number
+        ): boolean => {
+          const fauxRes = new Response(raw, { status });
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            setUploadProgress(null);
+            throw new Error(
+              messageForFailedProcessResponse(fauxRes, raw, true)
+            );
+          }
+
+          const ok = status >= 200 && status < 300;
+          if (!ok) {
+            setUploadProgress(null);
+            const errText =
+              typeof parsed.error === "string" && parsed.error
+                ? parsed.error
+                : messageForFailedProcessResponse(fauxRes, raw);
+            if (status === 401 || /unauthorized/i.test(errText)) {
+              setError(SESSION_EXPIRED_COPY);
+              redirectToSignIn({ redirectUrl: window.location.href });
+              return false;
+            }
+            throw new Error(errText);
+          }
+
+          if (status !== 202) {
+            setUploadProgress(null);
+            throw new Error(
+              "Unexpected response from server. Try again or update the app."
+            );
+          }
+
+          const uploadJobId =
+            typeof parsed.jobId === "string" ? parsed.jobId : "";
+          if (!uploadJobId || uploadJobId !== jobId) {
+            setUploadProgress(null);
+            throw new Error("Server did not return a consistent job id.");
+          }
+
           setUploadProgress(null);
-          const errText =
-            typeof parsed.error === "string" && parsed.error
-              ? parsed.error
-              : messageForFailedProcessResponse(fauxRes, raw);
-          if (xhrRes.status === 401 || /unauthorized/i.test(errText)) {
+          logUiE2e("upload_response_received", uiE2eT0, jobId);
+          return true;
+        };
+
+        if (r2UploadUrl != null) {
+          logUiE2e("r2_presign_received", uiE2eT0, jobId);
+          uploadStartMsRef.current = 0;
+          setUploadProgress({
+            loaded: 0,
+            total: file.size,
+            percent: 0,
+            etaSec: null,
+          });
+          logUiE2e("upload_request_started", uiE2eT0, jobId);
+
+          let putRes = await putFileToPresignedUrlWithProgress(
+            r2UploadUrl,
+            file,
+            r2ContentType,
+            {
+              onProgress: (p) => setUploadProgress(p),
+              uploadStartMsRef,
+            }
+          );
+
+          if (!putRes.ok) {
+            setUploadProgress(null);
+            const fauxPut = new Response(putRes.body, {
+              status: putRes.status,
+            });
+            const errMsg =
+              putRes.body.trim() ||
+              messageForFailedProcessResponse(fauxPut, putRes.body);
+            throw new Error(
+              errMsg || "Upload to storage failed. Try again."
+            );
+          }
+
+          const postUploadComplete = () =>
+            fetch("/api/process/upload-complete", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ jobId }),
+            });
+
+          let completeRes = await postUploadComplete();
+          if (completeRes.status === 401) {
+            sessionOk = await refreshClerkSessionForUpload(getToken);
+            if (sessionOk) {
+              completeRes = await postUploadComplete();
+            }
+          }
+          if (completeRes.status === 401) {
+            setUploadProgress(null);
             setError(SESSION_EXPIRED_COPY);
             redirectToSignIn({ redirectUrl: window.location.href });
             return;
           }
-          throw new Error(errText);
-        }
 
-        if (xhrRes.status !== 202) {
-          setUploadProgress(null);
-          throw new Error(
-            "Unexpected response from server. Try again or update the app."
-          );
-        }
+          const completeRaw = await completeRes.text();
+          if (!finishQueuedResponse(completeRaw, completeRes.status)) {
+            return;
+          }
+        } else {
+          uploadStartMsRef.current = 0;
+          setUploadProgress({
+            loaded: 0,
+            total: file.size,
+            percent: 0,
+            etaSec: null,
+          });
 
-        const uploadJobId =
-          typeof parsed.jobId === "string" ? parsed.jobId : "";
-        if (!uploadJobId || uploadJobId !== jobId) {
-          setUploadProgress(null);
-          throw new Error("Server did not return a consistent job id.");
-        }
+          logUiE2e("upload_request_started", uiE2eT0, jobId);
 
-        setUploadProgress(null);
-        logUiE2e("upload_response_received", uiE2eT0, jobId);
+          const runUpload = () =>
+            postMultipartWithUploadProgress(
+              "/api/process/upload",
+              buildUploadForm(),
+              {
+                onProgress: (p) => setUploadProgress(p),
+                uploadStartMsRef,
+              }
+            );
+
+          let xhrRes = await runUpload();
+          if (xhrRes.status === 401) {
+            sessionOk = await refreshClerkSessionForUpload(getToken);
+            if (sessionOk) {
+              uploadStartMsRef.current = 0;
+              setUploadProgress({
+                loaded: 0,
+                total: file.size,
+                percent: 0,
+                etaSec: null,
+              });
+              xhrRes = await runUpload();
+            }
+          }
+          if (xhrRes.status === 401) {
+            setUploadProgress(null);
+            setError(SESSION_EXPIRED_COPY);
+            redirectToSignIn({ redirectUrl: window.location.href });
+            return;
+          }
+
+          if (!finishQueuedResponse(xhrRes.body, xhrRes.status)) {
+            return;
+          }
+        }
 
         cancelSimulate = simulateProgress(1);
 
