@@ -25,6 +25,10 @@ export const maxDuration = 600;
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+function fmtMs(ms: number): string {
+  return ms.toFixed(1);
+}
+
 function jsonError(message: string, status: number) {
   const safe = message.slice(0, 2000);
   return NextResponse.json(
@@ -84,9 +88,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const t0 = performance.now();
+    let headMs = 0;
+    let downloadMs = 0;
+    let durationMs = 0;
+    let budgetMs = 0;
+
+    const tHead = performance.now();
     try {
       await assertJobSourceExistsInR2(jobId);
+      headMs = performance.now() - tHead;
     } catch (e: unknown) {
+      headMs = performance.now() - tHead;
+      console.log(
+        `[upload-complete] jobId=${jobId} totalMs=${fmtMs(performance.now() - t0)} headMs=${fmtMs(headMs)} downloadMs=— durationMs=— budgetMs=— note=head_failed`
+      );
       if (e instanceof R2SourceObjectMissingError) {
         return jsonError(
           "Video not found in storage. Complete the R2 PUT upload first, then call upload-complete.",
@@ -103,9 +119,15 @@ export async function POST(req: NextRequest) {
     const ROOT = getStorageRoot();
     const videoPath = path.join(ROOT, "uploads", `${jobId}.mp4`);
 
+    const tDl = performance.now();
     try {
       await downloadJobSourceToFile(jobId, videoPath);
+      downloadMs = performance.now() - tDl;
     } catch (e: unknown) {
+      downloadMs = performance.now() - tDl;
+      console.log(
+        `[upload-complete] jobId=${jobId} totalMs=${fmtMs(performance.now() - t0)} headMs=${fmtMs(headMs)} downloadMs=${fmtMs(downloadMs)} durationMs=— budgetMs=— note=download_failed`
+      );
       console.error("[R2] download to disk error:", e);
       return jsonError(
         e instanceof Error ? e.message : "Failed to copy video from R2 to server",
@@ -113,12 +135,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const finalize = await finalizeJobAfterLocalVideoWritten({
-      jobId,
-      userId,
-      videoPath,
-      rec,
-    });
+    let finalize: NextResponse | null = null;
+    try {
+      finalize = await finalizeJobAfterLocalVideoWritten({
+        jobId,
+        userId,
+        videoPath,
+        rec,
+        onTimingMs: (phase, ms) => {
+          if (phase === "getVideoDuration") durationMs = ms;
+          if (phase === "getProcessingBudget") budgetMs = ms;
+        },
+      });
+    } finally {
+      console.log(
+        `[upload-complete] jobId=${jobId} totalMs=${fmtMs(performance.now() - t0)} headMs=${fmtMs(headMs)} downloadMs=${fmtMs(downloadMs)} durationMs=${fmtMs(durationMs)} budgetMs=${fmtMs(budgetMs)}`
+      );
+    }
+
     if (finalize) return finalize;
 
     return successQueuedJsonResponse(jobId);

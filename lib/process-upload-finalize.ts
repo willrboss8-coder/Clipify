@@ -20,10 +20,17 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   userId: string;
   videoPath: string;
   rec: JobRecord;
+  /** Optional: R2 upload-complete instrumentation only; does not change behavior. */
+  onTimingMs?: (
+    phase: "getVideoDuration" | "getProcessingBudget",
+    ms: number
+  ) => void;
 }): Promise<NextResponse | null> {
-  const { jobId, userId, videoPath, rec } = params;
+  const { jobId, userId, videoPath, rec, onTimingMs } = params;
 
+  let t = performance.now();
   const durationSec = await getVideoDuration(videoPath);
+  onTimingMs?.("getVideoDuration", performance.now() - t);
   if (!Number.isFinite(durationSec) || durationSec <= 0) {
     await failJob(rec, "Could not read video duration. Try another file.");
     return NextResponse.json(
@@ -36,7 +43,9 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   }
   const durationMin = durationSec / 60;
 
+  t = performance.now();
   const budget = await getProcessingBudget(userId, durationMin);
+  onTimingMs?.("getProcessingBudget", performance.now() - t);
   console.log(`[Usage] User plan: ${budget.usage.plan}`);
   console.log(
     `[Usage] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`

@@ -1211,6 +1211,8 @@ export default function HomePage() {
             );
           }
 
+          logUiE2e("r2_put_finished", uiE2eT0, jobId);
+
           const postUploadComplete = () =>
             fetch("/api/process/upload-complete", {
               method: "POST",
