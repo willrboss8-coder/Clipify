@@ -42,28 +42,65 @@ const STATUS_STEPS = [
 
 const STEP_DELAYS = [3000, 4000, 6000, 5000, 8000, 6000];
 
-/** Rough ranges for the simulated pipeline card (not a live countdown). */
-function processingEtaLabel(statusIdx: number): string {
+/**
+ * Approximate remaining seconds when a pipeline step becomes active (midpoints of the
+ * former static ranges). Resets when `statusIdx` advances.
+ */
+const STEP_ESTIMATE_REMAINING_SEC: Record<number, number> = {
+  0: 55,
+  1: 55,
+  2: 67,
+  3: 37,
+  4: 32,
+  5: 17,
+};
+
+function getPipelineStepEstimateSeconds(statusIdx: number): number {
+  return STEP_ESTIMATE_REMAINING_SEC[statusIdx] ?? 60;
+}
+
+/** Lightweight approximate countdown for the processing card (bottom-right). */
+function ProcessingEtaCountdown({ statusIdx }: { statusIdx: number }) {
+  const [display, setDisplay] = useState<
+    { kind: "sec"; n: number } | { kind: "overrun" }
+  >(() => ({
+    kind: "sec",
+    n: getPipelineStepEstimateSeconds(
+      statusIdx >= 0 ? statusIdx : 1
+    ),
+  }));
+
+  useEffect(() => {
+    if (statusIdx < 0) return;
+    if (statusIdx >= STATUS_STEPS.length - 1) return;
+
+    const est = getPipelineStepEstimateSeconds(statusIdx);
+    const endAt = Date.now() + est * 1000;
+
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+      if (left <= 0) {
+        setDisplay({ kind: "overrun" });
+      } else {
+        setDisplay({ kind: "sec", n: left });
+      }
+    };
+
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [statusIdx]);
+
   if (statusIdx < 0) {
-    return "Usually about 1–2 min";
+    return <>Usually about 1–2 min</>;
   }
-  switch (statusIdx) {
-    case 0:
-    case 1:
-      return "Est. time left: ~30–75 sec";
-    case 2:
-      return "Est. time left: ~45–90 sec";
-    case 3:
-      return "Est. time left: ~25–50 sec";
-    case 4:
-      return "Est. time left: ~20–45 sec";
-    case 5:
-      return "Est. time left: ~10–25 sec";
-    case 6:
-      return "Almost done";
-    default:
-      return "Usually about 1–2 min";
+  if (statusIdx >= STATUS_STEPS.length - 1) {
+    return <>Almost done</>;
   }
+  if (display.kind === "overrun") {
+    return <>Taking a little longer than usual…</>;
+  }
+  return <>~{display.n} sec left</>;
 }
 
 function getRecommendation(
@@ -2612,9 +2649,9 @@ export default function HomePage() {
                       </p>
                       <p
                         className="text-[11px] text-gray-500/85 shrink-0 text-right leading-snug max-w-[55%]"
-                        title="Rough range based on the current step"
+                        title="Approximate time; resets when the step changes"
                       >
-                        {processingEtaLabel(statusIdx)}
+                        <ProcessingEtaCountdown statusIdx={statusIdx} />
                       </p>
                     </div>
                   </div>
