@@ -351,8 +351,10 @@ export default function HomePage() {
   );
   const [isCreatingJob, setIsCreatingJob] = useState(false);
   const uploadStartMsRef = useRef(0);
-  /** Background upload before Generate; when true, Generate stays enabled during R2 PUT. */
+  /** Background preflight work (init + presign + optional R2 PUT); disables Generate while true. */
   const [preflightUploadActive, setPreflightUploadActive] = useState(false);
+  /** After preflight finishes (R2 bytes in bucket or multipart job ready); cleared on Generate/invalidate. */
+  const [preflightReadyHint, setPreflightReadyHint] = useState(false);
   const preflightRunIdRef = useRef(0);
   const preflightPutXhrRef = useRef<XMLHttpRequest | null>(null);
   const preflightPutPromiseRef = useRef<Promise<void> | null>(null);
@@ -453,6 +455,7 @@ export default function HomePage() {
       preflightPutPromiseRef.current = null;
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
+      setPreflightReadyHint(false);
       setUploadProgress(null);
       return;
     }
@@ -462,6 +465,9 @@ export default function HomePage() {
     void (async () => {
       const sessionOk = await refreshClerkSessionForUpload(getToken);
       if (!sessionOk || preflightRunIdRef.current !== myId) return;
+
+      setPreflightReadyHint(false);
+      setPreflightUploadActive(true);
 
       const postInit = () =>
         fetch("/api/process/init", {
@@ -476,9 +482,13 @@ export default function HomePage() {
         const ok = await refreshClerkSessionForUpload(getToken);
         if (ok) initRes = await postInit();
       }
-      if (preflightRunIdRef.current !== myId) return;
+      if (preflightRunIdRef.current !== myId) {
+        setPreflightUploadActive(false);
+        return;
+      }
       if (initRes.status === 401) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightUploadActive(false);
         return;
       }
 
@@ -488,16 +498,19 @@ export default function HomePage() {
         initParsed = JSON.parse(initRaw) as Record<string, unknown>;
       } catch {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightUploadActive(false);
         return;
       }
       if (!initRes.ok || initRes.status !== 202) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightUploadActive(false);
         return;
       }
       const jobId =
         typeof initParsed.jobId === "string" ? initParsed.jobId : "";
       if (!jobId) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightUploadActive(false);
         return;
       }
 
@@ -531,9 +544,13 @@ export default function HomePage() {
           }
         }
       }
-      if (preflightRunIdRef.current !== myId) return;
+      if (preflightRunIdRef.current !== myId) {
+        setPreflightUploadActive(false);
+        return;
+      }
       if (urlRes.status === 401) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightUploadActive(false);
         return;
       }
 
@@ -564,6 +581,7 @@ export default function HomePage() {
           urlRes.status === 409
         ) {
           preflightSnapshotRef.current = { kind: "error" };
+          setPreflightUploadActive(false);
           return;
         }
         preflightSnapshotRef.current = {
@@ -574,6 +592,8 @@ export default function HomePage() {
           fileKey: fileKeyFromFile(file),
         };
         preflightPutPromiseRef.current = null;
+        setPreflightUploadActive(false);
+        setPreflightReadyHint(true);
         return;
       }
 
@@ -594,7 +614,6 @@ export default function HomePage() {
       preflightPutPromiseRef.current = putDone;
 
       uploadStartMsRef.current = 0;
-      setPreflightUploadActive(true);
       setUploadProgress({
         loaded: 0,
         total: file.size,
@@ -626,6 +645,7 @@ export default function HomePage() {
           fileKey: fk,
           contentType: r2ContentType,
         };
+        setPreflightReadyHint(true);
       } catch (e: unknown) {
         if (preflightRunIdRef.current !== myId) return;
         const msg = e instanceof Error ? e.message : "";
@@ -650,6 +670,7 @@ export default function HomePage() {
       preflightPutPromiseRef.current = null;
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
+      setPreflightReadyHint(false);
       setUploadProgress(null);
     };
   }, [file, platform, goal, isSignedIn, authLoaded, getToken]);
@@ -1266,6 +1287,7 @@ export default function HomePage() {
           preflightPutPromiseRef.current = null;
           preflightSnapshotRef.current = { kind: "none" };
           setPreflightUploadActive(false);
+          setPreflightReadyHint(false);
         }
 
         const finalizeUploadResponse = async (
@@ -1323,6 +1345,7 @@ export default function HomePage() {
               ) {
                 setUploadProgress(null);
                 preflightSnapshotRef.current = { kind: "none" };
+                setPreflightReadyHint(false);
                 logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
                 logUiE2e("upload_idempotent_recover", uiE2eT0, expectedJobId);
                 return true;
@@ -1366,6 +1389,7 @@ export default function HomePage() {
 
           setUploadProgress(null);
           preflightSnapshotRef.current = { kind: "none" };
+          setPreflightReadyHint(false);
           logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
           return true;
         };
@@ -1811,6 +1835,7 @@ export default function HomePage() {
   const isProcessing =
     !error &&
     (isCreatingJob ||
+      preflightUploadActive ||
       (uploadProgress !== null && !preflightUploadActive) ||
       (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
 
@@ -2472,15 +2497,33 @@ export default function HomePage() {
                   className="w-full py-4 rounded-xl font-semibold text-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20"
                 >
                   {isProcessing
-                    ? uploadProgress
-                      ? "Uploading..."
-                      : isCreatingJob
-                        ? "Preparing..."
-                        : "Processing..."
+                    ? preflightUploadActive
+                      ? uploadProgress
+                        ? "Uploading video..."
+                        : "Preparing video..."
+                      : uploadProgress
+                        ? "Uploading..."
+                        : isCreatingJob
+                          ? "Preparing..."
+                          : "Processing..."
                     : usage != null && usage.minutesRemaining <= 0
                       ? "No minutes remaining"
                       : "Generate Clips"}
                 </button>
+                {preflightUploadActive && !result && (
+                  <p className="text-xs text-gray-500 mt-2 text-center">
+                    Clips will be ready to generate after upload finishes.
+                  </p>
+                )}
+                {preflightReadyHint &&
+                  !preflightUploadActive &&
+                  !isCreatingJob &&
+                  file &&
+                  !result && (
+                    <p className="text-xs text-emerald-400/85 mt-2 text-center">
+                      Upload ready — you can generate clips.
+                    </p>
+                  )}
 
                 {/* Upload progress (real bytes); no fake pipeline steps here */}
                 {!result && (isCreatingJob || uploadProgress) && (
