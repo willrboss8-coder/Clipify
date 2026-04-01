@@ -42,6 +42,30 @@ const STATUS_STEPS = [
 
 const STEP_DELAYS = [3000, 4000, 6000, 5000, 8000, 6000];
 
+/** Rough ranges for the simulated pipeline card (not a live countdown). */
+function processingEtaLabel(statusIdx: number): string {
+  if (statusIdx < 0) {
+    return "Usually about 1–2 min";
+  }
+  switch (statusIdx) {
+    case 0:
+    case 1:
+      return "Est. time left: ~30–75 sec";
+    case 2:
+      return "Est. time left: ~45–90 sec";
+    case 3:
+      return "Est. time left: ~25–50 sec";
+    case 4:
+      return "Est. time left: ~20–45 sec";
+    case 5:
+      return "Est. time left: ~10–25 sec";
+    case 6:
+      return "Almost done";
+    default:
+      return "Usually about 1–2 min";
+  }
+}
+
 function getRecommendation(
   _platform: Platform,
   goal: Goal
@@ -1244,35 +1268,86 @@ export default function HomePage() {
           setPreflightUploadActive(false);
         }
 
-        const finishQueuedResponse = (
+        const finalizeUploadResponse = async (
           raw: string,
           status: number,
           expectedJobId: string
-        ): boolean => {
-          const fauxRes = new Response(raw, { status });
+        ): Promise<boolean> => {
           let parsed: Record<string, unknown>;
           try {
             parsed = JSON.parse(raw) as Record<string, unknown>;
           } catch {
+            const fauxRes = new Response(raw, { status });
             setUploadProgress(null);
             throw new Error(
               messageForFailedProcessResponse(fauxRes, raw, true)
             );
           }
 
+          const errText =
+            typeof parsed.error === "string" ? parsed.error : "";
+
+          /** Duplicate upload-complete / multipart after job already left awaiting_upload */
+          if (status === 409) {
+            if (
+              /not waiting for upload|wrong status|upload already completed/i.test(
+                errText
+              )
+            ) {
+              const r = await fetch(`/api/jobs/${expectedJobId}`, {
+                credentials: "include",
+                cache: "no-store",
+              });
+              if (r.status === 401) {
+                setUploadProgress(null);
+                setError(SESSION_EXPIRED_COPY);
+                redirectToSignIn({ redirectUrl: window.location.href });
+                return false;
+              }
+              if (!r.ok) {
+                const t = await r.text();
+                setUploadProgress(null);
+                throw new Error(
+                  t.trim().slice(0, 300) || errText || "Upload step failed."
+                );
+              }
+              const jr = (await r.json()) as {
+                status?: string;
+                error?: string;
+              };
+              const st = jr.status;
+              if (
+                st === "queued" ||
+                st === "processing" ||
+                st === "completed"
+              ) {
+                setUploadProgress(null);
+                preflightSnapshotRef.current = { kind: "none" };
+                logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
+                logUiE2e("upload_idempotent_recover", uiE2eT0, expectedJobId);
+                return true;
+              }
+              if (st === "failed") {
+                setUploadProgress(null);
+                throw new Error(jr.error || "Processing failed");
+              }
+              setUploadProgress(null);
+              throw new Error(errText || "Upload step failed.");
+            }
+          }
+
           const ok = status >= 200 && status < 300;
           if (!ok) {
             setUploadProgress(null);
-            const errText =
-              typeof parsed.error === "string" && parsed.error
-                ? parsed.error
-                : messageForFailedProcessResponse(fauxRes, raw);
+            const fauxRes = new Response(raw, { status });
             if (status === 401 || /unauthorized/i.test(errText)) {
               setError(SESSION_EXPIRED_COPY);
               redirectToSignIn({ redirectUrl: window.location.href });
               return false;
             }
-            throw new Error(errText);
+            throw new Error(
+              errText || messageForFailedProcessResponse(fauxRes, raw)
+            );
           }
 
           if (status !== 202) {
@@ -1290,6 +1365,7 @@ export default function HomePage() {
           }
 
           setUploadProgress(null);
+          preflightSnapshotRef.current = { kind: "none" };
           logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
           return true;
         };
@@ -1333,7 +1409,7 @@ export default function HomePage() {
           }
 
           const completeRaw = await completeRes.text();
-          if (!finishQueuedResponse(completeRaw, completeRes.status, jobId)) {
+          if (!(await finalizeUploadResponse(completeRaw, completeRes.status, jobId))) {
             return;
           }
           jobIdForPoll = jobId;
@@ -1394,7 +1470,7 @@ export default function HomePage() {
             return;
           }
 
-          if (!finishQueuedResponse(xhrRes.body, xhrRes.status, jobId)) {
+          if (!(await finalizeUploadResponse(xhrRes.body, xhrRes.status, jobId))) {
             return;
           }
           jobIdForPoll = jobId;
@@ -1621,7 +1697,7 @@ export default function HomePage() {
           }
 
           const completeRaw = await completeRes.text();
-          if (!finishQueuedResponse(completeRaw, completeRes.status, jobId)) {
+          if (!(await finalizeUploadResponse(completeRaw, completeRes.status, jobId))) {
             return;
           }
         } else {
@@ -1666,7 +1742,7 @@ export default function HomePage() {
             return;
           }
 
-          if (!finishQueuedResponse(xhrRes.body, xhrRes.status, jobId)) {
+          if (!(await finalizeUploadResponse(xhrRes.body, xhrRes.status, jobId))) {
             return;
           }
         }
@@ -2487,9 +2563,17 @@ export default function HomePage() {
                         );
                       })}
                     </div>
-                    <p className="text-xs text-gray-500 mt-4">
-                      This may take a moment, especially for longer videos.
-                    </p>
+                    <div className="mt-4 flex items-end justify-between gap-3">
+                      <p className="text-xs text-gray-500 min-w-0 flex-1">
+                        This may take a moment, especially for longer videos.
+                      </p>
+                      <p
+                        className="text-[11px] text-gray-500/85 shrink-0 text-right leading-snug max-w-[55%]"
+                        title="Rough range based on the current step"
+                      >
+                        {processingEtaLabel(statusIdx)}
+                      </p>
+                    </div>
                   </div>
                 )}
 
