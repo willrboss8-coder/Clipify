@@ -98,7 +98,7 @@ function ProcessingEtaCountdown({ statusIdx }: { statusIdx: number }) {
     return <>Almost done</>;
   }
   if (display.kind === "overrun") {
-    return <>Taking a little longer than usual…</>;
+    return <>Almost there...</>;
   }
   return <>~{display.n} sec left</>;
 }
