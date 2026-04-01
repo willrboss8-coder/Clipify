@@ -15,8 +15,12 @@ Logs for operators go to stderr only; stdout is reserved for the protocol.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from whisper_env import resolve_whisper_model  # noqa: E402
 
 
 def log(msg: str) -> None:
@@ -32,8 +36,11 @@ def main() -> None:
         )
         sys.exit(1)
 
+    model_name = resolve_whisper_model()
+    log(f"[whisper] loading model={model_name}")
+
     t0 = time.perf_counter()
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
     load_sec = time.perf_counter() - t0
 
     print(
@@ -41,6 +48,7 @@ def main() -> None:
             {
                 "type": "ready",
                 "model_load_sec": round(load_sec, 3),
+                "whisper_model": model_name,
             }
         ),
         flush=True,

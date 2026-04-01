@@ -97,6 +97,10 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function fileKeyFromFile(f: File): string {
+  return `${f.name}:${f.size}:${f.lastModified}`;
+}
+
 /**
  * Multipart POST with upload progress (fetch has no upload progress on request body).
  */
@@ -160,10 +164,13 @@ function putFileToPresignedUrlWithProgress(
   opts: {
     onProgress: (p: UploadProgressState) => void;
     uploadStartMsRef: MutableRefObject<number>;
+    /** When set, caller can abort() to cancel (e.g. preflight invalidation). */
+    xhrRefForAbort?: MutableRefObject<XMLHttpRequest | null>;
   }
 ): Promise<{ ok: boolean; status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = xhr;
     xhr.open("PUT", uploadUrl);
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && e.total > 0) {
@@ -190,14 +197,21 @@ function putFileToPresignedUrlWithProgress(
       }
     };
     xhr.onload = () => {
+      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
       resolve({
         ok: xhr.status >= 200 && xhr.status < 300,
         status: xhr.status,
         body: xhr.responseText,
       });
     };
-    xhr.onerror = () => reject(new Error("Network error"));
-    xhr.onabort = () => reject(new Error("Upload aborted"));
+    xhr.onerror = () => {
+      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
+      reject(new Error("Network error"));
+    };
+    xhr.onabort = () => {
+      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
+      reject(new Error("Upload aborted"));
+    };
     xhr.setRequestHeader("Content-Type", contentType);
     xhr.send(file);
   });
@@ -313,6 +327,38 @@ export default function HomePage() {
   );
   const [isCreatingJob, setIsCreatingJob] = useState(false);
   const uploadStartMsRef = useRef(0);
+  /** Background upload before Generate; when true, Generate stays enabled during R2 PUT. */
+  const [preflightUploadActive, setPreflightUploadActive] = useState(false);
+  const preflightRunIdRef = useRef(0);
+  const preflightPutXhrRef = useRef<XMLHttpRequest | null>(null);
+  const preflightPutPromiseRef = useRef<Promise<void> | null>(null);
+  type PreflightSnapshot =
+    | { kind: "none" }
+    | {
+        kind: "running";
+        jobId: string;
+        platform: Platform;
+        goal: Goal;
+        fileKey: string;
+        contentType: string;
+      }
+    | {
+        kind: "r2_put_done";
+        jobId: string;
+        platform: Platform;
+        goal: Goal;
+        fileKey: string;
+        contentType: string;
+      }
+    | {
+        kind: "multipart_only";
+        jobId: string;
+        platform: Platform;
+        goal: Goal;
+        fileKey: string;
+      }
+    | { kind: "error" };
+  const preflightSnapshotRef = useRef<PreflightSnapshot>({ kind: "none" });
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -373,6 +419,216 @@ export default function HomePage() {
       URL.revokeObjectURL(url);
     };
   }, [file]);
+
+  /** Background init + R2 PUT only (no upload-complete) so upload overlaps user choices. */
+  useEffect(() => {
+    if (!file || !isSignedIn || !authLoaded) {
+      preflightRunIdRef.current += 1;
+      preflightPutXhrRef.current?.abort();
+      preflightPutXhrRef.current = null;
+      preflightPutPromiseRef.current = null;
+      preflightSnapshotRef.current = { kind: "none" };
+      setPreflightUploadActive(false);
+      setUploadProgress(null);
+      return;
+    }
+
+    const myId = ++preflightRunIdRef.current;
+
+    void (async () => {
+      const sessionOk = await refreshClerkSessionForUpload(getToken);
+      if (!sessionOk || preflightRunIdRef.current !== myId) return;
+
+      const postInit = () =>
+        fetch("/api/process/init", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ platform, goal }),
+        });
+
+      let initRes = await postInit();
+      if (initRes.status === 401) {
+        const ok = await refreshClerkSessionForUpload(getToken);
+        if (ok) initRes = await postInit();
+      }
+      if (preflightRunIdRef.current !== myId) return;
+      if (initRes.status === 401) {
+        preflightSnapshotRef.current = { kind: "error" };
+        return;
+      }
+
+      const initRaw = await initRes.text();
+      let initParsed: Record<string, unknown>;
+      try {
+        initParsed = JSON.parse(initRaw) as Record<string, unknown>;
+      } catch {
+        preflightSnapshotRef.current = { kind: "error" };
+        return;
+      }
+      if (!initRes.ok || initRes.status !== 202) {
+        preflightSnapshotRef.current = { kind: "error" };
+        return;
+      }
+      const jobId =
+        typeof initParsed.jobId === "string" ? initParsed.jobId : "";
+      if (!jobId) {
+        preflightSnapshotRef.current = { kind: "error" };
+        return;
+      }
+
+      const postUploadUrl = () =>
+        fetch("/api/process/upload-url", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jobId }),
+        });
+
+      let urlRes: Response;
+      try {
+        urlRes = await postUploadUrl();
+      } catch {
+        urlRes = new Response(
+          JSON.stringify({ error: "network" }),
+          { status: 503 }
+        );
+      }
+      if (urlRes.status === 401) {
+        const ok = await refreshClerkSessionForUpload(getToken);
+        if (ok) {
+          try {
+            urlRes = await postUploadUrl();
+          } catch {
+            urlRes = new Response(
+              JSON.stringify({ error: "network" }),
+              { status: 503 }
+            );
+          }
+        }
+      }
+      if (preflightRunIdRef.current !== myId) return;
+      if (urlRes.status === 401) {
+        preflightSnapshotRef.current = { kind: "error" };
+        return;
+      }
+
+      const urlText = await urlRes.text();
+      let r2UploadUrl: string | null = null;
+      let r2ContentType = "video/mp4";
+      if (urlRes.ok && urlRes.status === 200) {
+        try {
+          const urlParsed = JSON.parse(urlText) as Record<string, unknown>;
+          if (
+            typeof urlParsed.uploadUrl === "string" &&
+            urlParsed.uploadUrl.length > 0
+          ) {
+            r2UploadUrl = urlParsed.uploadUrl;
+            if (typeof urlParsed.contentType === "string") {
+              r2ContentType = urlParsed.contentType;
+            }
+          }
+        } catch {
+          /* no presigned URL */
+        }
+      }
+
+      if (r2UploadUrl == null) {
+        if (
+          urlRes.status === 400 ||
+          urlRes.status === 404 ||
+          urlRes.status === 409
+        ) {
+          preflightSnapshotRef.current = { kind: "error" };
+          return;
+        }
+        preflightSnapshotRef.current = {
+          kind: "multipart_only",
+          jobId,
+          platform,
+          goal,
+          fileKey: fileKeyFromFile(file),
+        };
+        preflightPutPromiseRef.current = null;
+        return;
+      }
+
+      const fk = fileKeyFromFile(file);
+      preflightSnapshotRef.current = {
+        kind: "running",
+        jobId,
+        platform,
+        goal,
+        fileKey: fk,
+        contentType: r2ContentType,
+      };
+
+      let putResolve: (() => void) | undefined;
+      const putDone = new Promise<void>((r) => {
+        putResolve = r;
+      });
+      preflightPutPromiseRef.current = putDone;
+
+      uploadStartMsRef.current = 0;
+      setPreflightUploadActive(true);
+      setUploadProgress({
+        loaded: 0,
+        total: file.size,
+        percent: 0,
+        etaSec: null,
+      });
+
+      try {
+        const putRes = await putFileToPresignedUrlWithProgress(
+          r2UploadUrl,
+          file,
+          r2ContentType,
+          {
+            onProgress: (p) => setUploadProgress(p),
+            uploadStartMsRef,
+            xhrRefForAbort: preflightPutXhrRef,
+          }
+        );
+        if (preflightRunIdRef.current !== myId) return;
+        if (!putRes.ok) {
+          preflightSnapshotRef.current = { kind: "error" };
+          return;
+        }
+        preflightSnapshotRef.current = {
+          kind: "r2_put_done",
+          jobId,
+          platform,
+          goal,
+          fileKey: fk,
+          contentType: r2ContentType,
+        };
+      } catch (e: unknown) {
+        if (preflightRunIdRef.current !== myId) return;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg === "Upload aborted") {
+          preflightSnapshotRef.current = { kind: "none" };
+        } else {
+          preflightSnapshotRef.current = { kind: "error" };
+        }
+      } finally {
+        putResolve?.();
+        setPreflightUploadActive(false);
+        if (preflightRunIdRef.current === myId) {
+          setUploadProgress(null);
+        }
+      }
+    })();
+
+    return () => {
+      preflightRunIdRef.current += 1;
+      preflightPutXhrRef.current?.abort();
+      preflightPutXhrRef.current = null;
+      preflightPutPromiseRef.current = null;
+      preflightSnapshotRef.current = { kind: "none" };
+      setPreflightUploadActive(false);
+      setUploadProgress(null);
+    };
+  }, [file, platform, goal, isSignedIn, authLoaded, getToken]);
 
   /** After Stripe redirects back, Clerk session may still have old `publicMetadata` until reload */
   useEffect(() => {
@@ -965,6 +1221,184 @@ export default function HomePage() {
         setStatusIdx(-1);
         setUploadProgress(null);
 
+        const fileKey = fileKeyFromFile(file);
+        const snap0 = preflightSnapshotRef.current;
+        const fastR2 =
+          (snap0.kind === "r2_put_done" || snap0.kind === "running") &&
+          snap0.fileKey === fileKey &&
+          snap0.platform === platform &&
+          snap0.goal === goal;
+
+        const fastMultipart =
+          snap0.kind === "multipart_only" &&
+          snap0.fileKey === fileKey &&
+          snap0.platform === platform &&
+          snap0.goal === goal;
+
+        if (!fastR2 && !fastMultipart) {
+          preflightRunIdRef.current += 1;
+          preflightPutXhrRef.current?.abort();
+          preflightPutXhrRef.current = null;
+          preflightPutPromiseRef.current = null;
+          preflightSnapshotRef.current = { kind: "none" };
+          setPreflightUploadActive(false);
+        }
+
+        const finishQueuedResponse = (
+          raw: string,
+          status: number,
+          expectedJobId: string
+        ): boolean => {
+          const fauxRes = new Response(raw, { status });
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            setUploadProgress(null);
+            throw new Error(
+              messageForFailedProcessResponse(fauxRes, raw, true)
+            );
+          }
+
+          const ok = status >= 200 && status < 300;
+          if (!ok) {
+            setUploadProgress(null);
+            const errText =
+              typeof parsed.error === "string" && parsed.error
+                ? parsed.error
+                : messageForFailedProcessResponse(fauxRes, raw);
+            if (status === 401 || /unauthorized/i.test(errText)) {
+              setError(SESSION_EXPIRED_COPY);
+              redirectToSignIn({ redirectUrl: window.location.href });
+              return false;
+            }
+            throw new Error(errText);
+          }
+
+          if (status !== 202) {
+            setUploadProgress(null);
+            throw new Error(
+              "Unexpected response from server. Try again or update the app."
+            );
+          }
+
+          const uploadJobId =
+            typeof parsed.jobId === "string" ? parsed.jobId : "";
+          if (!uploadJobId || uploadJobId !== expectedJobId) {
+            setUploadProgress(null);
+            throw new Error("Server did not return a consistent job id.");
+          }
+
+          setUploadProgress(null);
+          logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
+          return true;
+        };
+
+        let jobIdForPoll: string;
+
+        if (fastR2) {
+          const jobId =
+            snap0.kind === "running" || snap0.kind === "r2_put_done"
+              ? snap0.jobId
+              : "";
+          if (!jobId) {
+            throw new Error("Preflight job id missing.");
+          }
+          if (preflightPutPromiseRef.current) {
+            await preflightPutPromiseRef.current;
+          }
+          setIsCreatingJob(false);
+          logUiE2e("preflight_reused", uiE2eT0, jobId);
+
+          const postUploadComplete = () =>
+            fetch("/api/process/upload-complete", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ jobId }),
+            });
+
+          let completeRes = await postUploadComplete();
+          if (completeRes.status === 401) {
+            sessionOk = await refreshClerkSessionForUpload(getToken);
+            if (sessionOk) {
+              completeRes = await postUploadComplete();
+            }
+          }
+          if (completeRes.status === 401) {
+            setUploadProgress(null);
+            setError(SESSION_EXPIRED_COPY);
+            redirectToSignIn({ redirectUrl: window.location.href });
+            return;
+          }
+
+          const completeRaw = await completeRes.text();
+          if (!finishQueuedResponse(completeRaw, completeRes.status, jobId)) {
+            return;
+          }
+          jobIdForPoll = jobId;
+        } else if (fastMultipart) {
+          const jobId =
+            snap0.kind === "multipart_only" ? snap0.jobId : "";
+          if (!jobId) {
+            throw new Error("Preflight job id missing.");
+          }
+          setIsCreatingJob(false);
+          logUiE2e("preflight_reused_multipart", uiE2eT0, jobId);
+
+          const buildUploadForm = () => {
+            const form = new FormData();
+            form.append("file", file);
+            form.append("jobId", jobId);
+            return form;
+          };
+
+          uploadStartMsRef.current = 0;
+          setUploadProgress({
+            loaded: 0,
+            total: file.size,
+            percent: 0,
+            etaSec: null,
+          });
+
+          logUiE2e("upload_request_started", uiE2eT0, jobId);
+
+          const runUpload = () =>
+            postMultipartWithUploadProgress(
+              "/api/process/upload",
+              buildUploadForm(),
+              {
+                onProgress: (p) => setUploadProgress(p),
+                uploadStartMsRef,
+              }
+            );
+
+          let xhrRes = await runUpload();
+          if (xhrRes.status === 401) {
+            sessionOk = await refreshClerkSessionForUpload(getToken);
+            if (sessionOk) {
+              uploadStartMsRef.current = 0;
+              setUploadProgress({
+                loaded: 0,
+                total: file.size,
+                percent: 0,
+                etaSec: null,
+              });
+              xhrRes = await runUpload();
+            }
+          }
+          if (xhrRes.status === 401) {
+            setUploadProgress(null);
+            setError(SESSION_EXPIRED_COPY);
+            redirectToSignIn({ redirectUrl: window.location.href });
+            return;
+          }
+
+          if (!finishQueuedResponse(xhrRes.body, xhrRes.status, jobId)) {
+            return;
+          }
+          jobIdForPoll = jobId;
+        } else {
         const postInit = () =>
           fetch("/api/process/init", {
             method: "POST",
@@ -1128,55 +1562,6 @@ export default function HomePage() {
           logUiE2e("upload_multipart_fallback", uiE2eT0, jobId);
         }
 
-        const finishQueuedResponse = (
-          raw: string,
-          status: number
-        ): boolean => {
-          const fauxRes = new Response(raw, { status });
-          let parsed: Record<string, unknown>;
-          try {
-            parsed = JSON.parse(raw) as Record<string, unknown>;
-          } catch {
-            setUploadProgress(null);
-            throw new Error(
-              messageForFailedProcessResponse(fauxRes, raw, true)
-            );
-          }
-
-          const ok = status >= 200 && status < 300;
-          if (!ok) {
-            setUploadProgress(null);
-            const errText =
-              typeof parsed.error === "string" && parsed.error
-                ? parsed.error
-                : messageForFailedProcessResponse(fauxRes, raw);
-            if (status === 401 || /unauthorized/i.test(errText)) {
-              setError(SESSION_EXPIRED_COPY);
-              redirectToSignIn({ redirectUrl: window.location.href });
-              return false;
-            }
-            throw new Error(errText);
-          }
-
-          if (status !== 202) {
-            setUploadProgress(null);
-            throw new Error(
-              "Unexpected response from server. Try again or update the app."
-            );
-          }
-
-          const uploadJobId =
-            typeof parsed.jobId === "string" ? parsed.jobId : "";
-          if (!uploadJobId || uploadJobId !== jobId) {
-            setUploadProgress(null);
-            throw new Error("Server did not return a consistent job id.");
-          }
-
-          setUploadProgress(null);
-          logUiE2e("upload_response_received", uiE2eT0, jobId);
-          return true;
-        };
-
         if (r2UploadUrl != null) {
           logUiE2e("r2_presign_received", uiE2eT0, jobId);
           uploadStartMsRef.current = 0;
@@ -1236,7 +1621,7 @@ export default function HomePage() {
           }
 
           const completeRaw = await completeRes.text();
-          if (!finishQueuedResponse(completeRaw, completeRes.status)) {
+          if (!finishQueuedResponse(completeRaw, completeRes.status, jobId)) {
             return;
           }
         } else {
@@ -1281,14 +1666,17 @@ export default function HomePage() {
             return;
           }
 
-          if (!finishQueuedResponse(xhrRes.body, xhrRes.status)) {
+          if (!finishQueuedResponse(xhrRes.body, xhrRes.status, jobId)) {
             return;
           }
         }
 
+        jobIdForPoll = jobId;
+        }
+
         cancelSimulate = simulateProgress(1);
 
-        const data = await pollJobUntilComplete(jobId, uiE2eT0);
+        const data = await pollJobUntilComplete(jobIdForPoll, uiE2eT0);
 
         if (
           typeof data.jobId !== "string" ||
@@ -1347,7 +1735,7 @@ export default function HomePage() {
   const isProcessing =
     !error &&
     (isCreatingJob ||
-      uploadProgress !== null ||
+      (uploadProgress !== null && !preflightUploadActive) ||
       (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
 
   return (

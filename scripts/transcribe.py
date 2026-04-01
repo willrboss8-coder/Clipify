@@ -2,7 +2,11 @@
 """Transcribe audio using faster-whisper and output JSON."""
 
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from whisper_env import resolve_whisper_model  # noqa: E402
 
 def main():
     if len(sys.argv) < 3:
@@ -18,7 +22,9 @@ def main():
         print("Error: faster-whisper not installed. Run: pip install faster-whisper", file=sys.stderr)
         sys.exit(1)
 
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model_name = resolve_whisper_model()
+    print(f"[whisper] model={model_name}", file=sys.stderr, flush=True)
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
     segments_iter, info = model.transcribe(audio_path, beam_size=1)
 

@@ -114,9 +114,13 @@ async function ensureDaemonReady(): Promise<void> {
     throw new Error("Transcribe daemon exited before ready.");
   }
 
-  let msg: { type?: string; model_load_sec?: number };
+  let msg: { type?: string; model_load_sec?: number; whisper_model?: string };
   try {
-    msg = JSON.parse(first) as { type?: string; model_load_sec?: number };
+    msg = JSON.parse(first) as {
+      type?: string;
+      model_load_sec?: number;
+      whisper_model?: string;
+    };
   } catch {
     proc.kill("SIGTERM");
     resetDaemonState();
@@ -128,7 +132,7 @@ async function ensureDaemonReady(): Promise<void> {
     throw new Error(`Transcribe daemon expected ready, got: ${first.slice(0, 200)}`);
   }
   console.log(
-    `[Transcribe daemon] ready model_load_sec=${msg.model_load_sec ?? "?"}`
+    `[Transcribe daemon] ready model_load_sec=${msg.model_load_sec ?? "?"} whisper_model=${msg.whisper_model ?? "?"}`
   );
   ready = true;
 }
