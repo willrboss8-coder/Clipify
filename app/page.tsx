@@ -392,6 +392,8 @@ export default function HomePage() {
   const [preflightUploadActive, setPreflightUploadActive] = useState(false);
   /** After preflight finishes (R2 bytes in bucket or multipart job ready); cleared on Generate/invalidate. */
   const [preflightReadyHint, setPreflightReadyHint] = useState(false);
+  /** Preflight ended without success (so we can enable a muted retry without blocking on hint). */
+  const [preflightTerminalFailed, setPreflightTerminalFailed] = useState(false);
   const preflightRunIdRef = useRef(0);
   const preflightPutXhrRef = useRef<XMLHttpRequest | null>(null);
   const preflightPutPromiseRef = useRef<Promise<void> | null>(null);
@@ -422,6 +424,9 @@ export default function HomePage() {
       }
     | { kind: "error" };
   const preflightSnapshotRef = useRef<PreflightSnapshot>({ kind: "none" });
+  /** Prevents duplicate handleGenerate calls (e.g. auto-start + Strict Mode / double effect). */
+  const generationInFlightRef = useRef(false);
+  const handleGenerateRef = useRef<() => Promise<void>>(async () => {});
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -493,6 +498,7 @@ export default function HomePage() {
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
       setPreflightReadyHint(false);
+      setPreflightTerminalFailed(false);
       setUploadProgress(null);
       return;
     }
@@ -504,6 +510,7 @@ export default function HomePage() {
       if (!sessionOk || preflightRunIdRef.current !== myId) return;
 
       setPreflightReadyHint(false);
+      setPreflightTerminalFailed(false);
       setPreflightUploadActive(true);
 
       const postInit = () =>
@@ -525,6 +532,7 @@ export default function HomePage() {
       }
       if (initRes.status === 401) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightTerminalFailed(true);
         setPreflightUploadActive(false);
         return;
       }
@@ -535,11 +543,13 @@ export default function HomePage() {
         initParsed = JSON.parse(initRaw) as Record<string, unknown>;
       } catch {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightTerminalFailed(true);
         setPreflightUploadActive(false);
         return;
       }
       if (!initRes.ok || initRes.status !== 202) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightTerminalFailed(true);
         setPreflightUploadActive(false);
         return;
       }
@@ -547,6 +557,7 @@ export default function HomePage() {
         typeof initParsed.jobId === "string" ? initParsed.jobId : "";
       if (!jobId) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightTerminalFailed(true);
         setPreflightUploadActive(false);
         return;
       }
@@ -587,6 +598,7 @@ export default function HomePage() {
       }
       if (urlRes.status === 401) {
         preflightSnapshotRef.current = { kind: "error" };
+        setPreflightTerminalFailed(true);
         setPreflightUploadActive(false);
         return;
       }
@@ -618,6 +630,7 @@ export default function HomePage() {
           urlRes.status === 409
         ) {
           preflightSnapshotRef.current = { kind: "error" };
+          setPreflightTerminalFailed(true);
           setPreflightUploadActive(false);
           return;
         }
@@ -672,6 +685,7 @@ export default function HomePage() {
         if (preflightRunIdRef.current !== myId) return;
         if (!putRes.ok) {
           preflightSnapshotRef.current = { kind: "error" };
+          setPreflightTerminalFailed(true);
           return;
         }
         preflightSnapshotRef.current = {
@@ -688,8 +702,10 @@ export default function HomePage() {
         const msg = e instanceof Error ? e.message : "";
         if (msg === "Upload aborted") {
           preflightSnapshotRef.current = { kind: "none" };
+          setPreflightTerminalFailed(false);
         } else {
           preflightSnapshotRef.current = { kind: "error" };
+          setPreflightTerminalFailed(true);
         }
       } finally {
         putResolve?.();
@@ -708,6 +724,7 @@ export default function HomePage() {
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
       setPreflightReadyHint(false);
+      setPreflightTerminalFailed(false);
       setUploadProgress(null);
     };
   }, [file, platform, goal, isSignedIn, authLoaded, getToken]);
@@ -1217,6 +1234,22 @@ export default function HomePage() {
     if (f) setFile(f);
   };
 
+  /** Abort in-flight preflight (same invalidation pattern as changing file); clears selection so the user can pick another video. */
+  const cancelPreflightUpload = useCallback(() => {
+    preflightRunIdRef.current += 1;
+    preflightPutXhrRef.current?.abort();
+    preflightPutXhrRef.current = null;
+    preflightPutPromiseRef.current = null;
+    preflightSnapshotRef.current = { kind: "none" };
+    setPreflightUploadActive(false);
+    setPreflightReadyHint(false);
+    setPreflightTerminalFailed(false);
+    setUploadProgress(null);
+    setFile(null);
+    setError(null);
+    if (inputRef.current) inputRef.current.value = "";
+  }, []);
+
   /** Simulated backend steps. Use `startStepIndex = 1` after file upload so we don&apos;t show &quot;Uploading video&quot; again. */
   const simulateProgress = (startStepIndex = 0) => {
     let cancelled = false;
@@ -1280,6 +1313,8 @@ export default function HomePage() {
       );
       return;
     }
+    if (generationInFlightRef.current) return;
+
     setError(null);
     setResult(null);
     setStatus(null);
@@ -1288,6 +1323,7 @@ export default function HomePage() {
     const uiE2eT0 = Date.now();
     logUiE2e("generate_click", uiE2eT0);
 
+    generationInFlightRef.current = true;
     try {
       let sessionOk = await refreshClerkSessionForUpload(getToken);
       if (!sessionOk) {
@@ -1325,6 +1361,7 @@ export default function HomePage() {
           preflightSnapshotRef.current = { kind: "none" };
           setPreflightUploadActive(false);
           setPreflightReadyHint(false);
+          setPreflightTerminalFailed(false);
         }
 
         const finalizeUploadResponse = async (
@@ -1383,6 +1420,7 @@ export default function HomePage() {
                 setUploadProgress(null);
                 preflightSnapshotRef.current = { kind: "none" };
                 setPreflightReadyHint(false);
+                setPreflightTerminalFailed(false);
                 logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
                 logUiE2e("upload_idempotent_recover", uiE2eT0, expectedJobId);
                 return true;
@@ -1427,6 +1465,7 @@ export default function HomePage() {
           setUploadProgress(null);
           preflightSnapshotRef.current = { kind: "none" };
           setPreflightReadyHint(false);
+          setPreflightTerminalFailed(false);
           logUiE2e("upload_response_received", uiE2eT0, expectedJobId);
           return true;
         };
@@ -1866,8 +1905,36 @@ export default function HomePage() {
             : "Something went wrong while finishing processing. Try again.";
       setError(msg);
       // Keep status/steps visible so users see where the run failed (e.g. stuck on "Finalizing results").
+    } finally {
+      generationInFlightRef.current = false;
     }
   };
+
+  handleGenerateRef.current = handleGenerate;
+
+  /** After preflight succeeds, start the same generate flow as the primary button (no extra click). */
+  useEffect(() => {
+    if (!preflightReadyHint || preflightUploadActive) return;
+    if (!file || result) return;
+    if (!authLoaded || !isSignedIn) return;
+    if (usage != null && usage.minutesRemaining <= 0) return;
+    if (preflightTerminalFailed) return;
+    if (error) return;
+    if (generationInFlightRef.current || isCreatingJob) return;
+
+    void handleGenerateRef.current();
+  }, [
+    preflightReadyHint,
+    preflightUploadActive,
+    file,
+    result,
+    authLoaded,
+    isSignedIn,
+    usage,
+    preflightTerminalFailed,
+    error,
+    isCreatingJob,
+  ]);
 
   const isProcessing =
     !error &&
@@ -1875,6 +1942,70 @@ export default function HomePage() {
       preflightUploadActive ||
       (uploadProgress !== null && !preflightUploadActive) ||
       (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
+
+  /** Waiting for first successful preflight (narrow gap before async sets `preflightUploadActive`). */
+  const mustWaitForPreflightGate =
+    !!file &&
+    isSignedIn &&
+    authLoaded &&
+    !preflightReadyHint &&
+    !preflightUploadActive &&
+    !preflightTerminalFailed;
+
+  const generateDisabled =
+    !file ||
+    isProcessing ||
+    (usage != null && usage.minutesRemaining <= 0) ||
+    mustWaitForPreflightGate ||
+    (file && !isSignedIn) ||
+    (file && !authLoaded);
+
+  /** Brief idle state after preflight before auto-start runs — keep CTA muted (no misleading primary). */
+  const autoClipStartPending =
+    preflightReadyHint &&
+    !preflightUploadActive &&
+    !error &&
+    !isProcessing;
+
+  const showPrimaryGenerateCta =
+    !generateDisabled &&
+    preflightReadyHint &&
+    !preflightTerminalFailed &&
+    !error &&
+    !autoClipStartPending;
+
+  let generateButtonLabel = "Generate Clips";
+  if (!file) {
+    generateButtonLabel = "Select a video first";
+  } else if (!authLoaded) {
+    generateButtonLabel = "Loading account...";
+  } else if (!isSignedIn) {
+    generateButtonLabel = "Sign in to generate";
+  } else if (usage != null && usage.minutesRemaining <= 0) {
+    generateButtonLabel = "No minutes remaining";
+  } else if (isProcessing) {
+    if (preflightUploadActive) {
+      generateButtonLabel = uploadProgress
+        ? "Uploading video..."
+        : "Preparing video...";
+    } else if (uploadProgress) {
+      generateButtonLabel = "Uploading...";
+    } else if (isCreatingJob) {
+      generateButtonLabel = preflightReadyHint
+        ? "Generating clips..."
+        : "Preparing...";
+    } else {
+      generateButtonLabel = "Processing...";
+    }
+  } else if (mustWaitForPreflightGate) {
+    generateButtonLabel = "Preparing video...";
+  } else if (
+    preflightReadyHint &&
+    !preflightUploadActive &&
+    !error
+  ) {
+    generateButtonLabel = "Starting clip generation…";
+  }
 
   return (
     <div className="min-h-screen">
@@ -2525,40 +2656,47 @@ export default function HomePage() {
 
                 {/* Generate Button */}
                 <button
+                  type="button"
                   onClick={handleGenerate}
-                  disabled={
-                    !file ||
-                    isProcessing ||
-                    (usage != null && usage.minutesRemaining <= 0)
-                  }
-                  className="w-full py-4 rounded-xl font-semibold text-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20"
+                  disabled={generateDisabled}
+                  className={`w-full py-4 rounded-xl font-semibold text-lg transition-all border ${
+                    showPrimaryGenerateCta
+                      ? "bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20 border-transparent"
+                      : "bg-gray-800/90 text-gray-500 border-gray-700/80 shadow-none"
+                  } ${
+                    generateDisabled
+                      ? "cursor-not-allowed opacity-50"
+                      : !showPrimaryGenerateCta
+                        ? "cursor-pointer text-gray-300 border-gray-600/80 hover:bg-gray-800/95 opacity-100"
+                        : "cursor-pointer opacity-100"
+                  }`}
                 >
-                  {isProcessing
-                    ? preflightUploadActive
-                      ? uploadProgress
-                        ? "Uploading video..."
-                        : "Preparing video..."
-                      : uploadProgress
-                        ? "Uploading..."
-                        : isCreatingJob
-                          ? "Preparing..."
-                          : "Processing..."
-                    : usage != null && usage.minutesRemaining <= 0
-                      ? "No minutes remaining"
-                      : "Generate Clips"}
+                  {generateButtonLabel}
                 </button>
                 {preflightUploadActive && !result && (
-                  <p className="text-xs text-gray-500 mt-2 text-center">
-                    Clips will be ready to generate after upload finishes.
-                  </p>
+                  <div className="mt-2 flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                    <p className="text-xs text-gray-500 text-center sm:text-left sm:flex-1">
+                      {uploadProgress
+                        ? "Uploading video… clip generation will begin automatically once upload is complete."
+                        : "Preparing video… clip generation will begin automatically once upload is complete."}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={cancelPreflightUpload}
+                      className="text-xs text-gray-400 hover:text-gray-200 underline underline-offset-2 text-center sm:text-right shrink-0"
+                    >
+                      Cancel upload
+                    </button>
+                  </div>
                 )}
                 {preflightReadyHint &&
                   !preflightUploadActive &&
                   !isCreatingJob &&
                   file &&
-                  !result && (
-                    <p className="text-xs text-emerald-400/85 mt-2 text-center">
-                      Upload ready — you can generate clips.
+                  !result &&
+                  error && (
+                    <p className="text-xs text-amber-400/90 mt-2 text-center">
+                      Something went wrong. Tap Generate Clips to try again.
                     </p>
                   )}
 
@@ -2566,7 +2704,11 @@ export default function HomePage() {
                 {!result && (isCreatingJob || uploadProgress) && (
                   <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-5">
                     {isCreatingJob && !uploadProgress && (
-                      <p className="text-white font-medium">Creating job…</p>
+                      <p className="text-white font-medium">
+                        {preflightReadyHint
+                          ? "Upload complete. Generating clips…"
+                          : "Creating job…"}
+                      </p>
                     )}
                     {uploadProgress && (
                       <div className="space-y-3">
@@ -2607,7 +2749,7 @@ export default function HomePage() {
                 {status && !result && !uploadProgress && !isCreatingJob && (
                   <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-5">
                     <p className="text-xs text-gray-500 mb-3">
-                      Upload complete — processing on the server.
+                      Upload complete. Generating clips…
                     </p>
                     <div className="space-y-2">
                       {STATUS_STEPS.slice(1).map((step, i) => {
