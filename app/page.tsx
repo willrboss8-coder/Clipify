@@ -452,6 +452,8 @@ export default function HomePage() {
   const [videoDurationSec, setVideoDurationSec] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Incremented when the user taps "Upload Video" so preflight only runs after an explicit action. */
+  const [uploadTrigger, setUploadTrigger] = useState(0);
 
   useEffect(() => {
     fetch("/api/usage", { credentials: "include" })
@@ -488,9 +490,13 @@ export default function HomePage() {
     };
   }, [file]);
 
+  useEffect(() => {
+    setUploadTrigger(0);
+  }, [file]);
+
   /** Background init + R2 PUT only (no upload-complete) so upload overlaps user choices. */
   useEffect(() => {
-    if (!file || !isSignedIn || !authLoaded) {
+    if (!file || !isSignedIn || !authLoaded || uploadTrigger === 0) {
       preflightRunIdRef.current += 1;
       preflightPutXhrRef.current?.abort();
       preflightPutXhrRef.current = null;
@@ -727,7 +733,7 @@ export default function HomePage() {
       setPreflightTerminalFailed(false);
       setUploadProgress(null);
     };
-  }, [file, platform, goal, isSignedIn, authLoaded, getToken]);
+  }, [file, platform, goal, isSignedIn, authLoaded, getToken, uploadTrigger]);
 
   /** After Stripe redirects back, Clerk session may still have old `publicMetadata` until reload */
   useEffect(() => {
@@ -1245,10 +1251,28 @@ export default function HomePage() {
     setPreflightReadyHint(false);
     setPreflightTerminalFailed(false);
     setUploadProgress(null);
+    setUploadTrigger(0);
     setFile(null);
     setError(null);
     if (inputRef.current) inputRef.current.value = "";
   }, []);
+
+  const handleUploadVideoClick = useCallback(() => {
+    if (!file || !authLoaded || !isSignedIn) return;
+    if (usage != null && usage.minutesRemaining <= 0) return;
+    if (preflightTerminalFailed) {
+      preflightRunIdRef.current += 1;
+      preflightPutXhrRef.current?.abort();
+      preflightPutXhrRef.current = null;
+      preflightPutPromiseRef.current = null;
+      preflightSnapshotRef.current = { kind: "none" };
+      setPreflightUploadActive(false);
+      setPreflightReadyHint(false);
+      setPreflightTerminalFailed(false);
+      setUploadProgress(null);
+    }
+    setUploadTrigger((n) => n + 1);
+  }, [file, authLoaded, isSignedIn, usage, preflightTerminalFailed]);
 
   /** Simulated backend steps. Use `startStepIndex = 1` after file upload so we don&apos;t show &quot;Uploading video&quot; again. */
   const simulateProgress = (startStepIndex = 0) => {
@@ -1943,11 +1967,12 @@ export default function HomePage() {
       (uploadProgress !== null && !preflightUploadActive) ||
       (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
 
-  /** Waiting for first successful preflight (narrow gap before async sets `preflightUploadActive`). */
+  /** User tapped Upload Video; waiting for preflight to begin or finish (narrow gap before `preflightUploadActive`). */
   const mustWaitForPreflightGate =
     !!file &&
     isSignedIn &&
     authLoaded &&
+    uploadTrigger > 0 &&
     !preflightReadyHint &&
     !preflightUploadActive &&
     !preflightTerminalFailed;
@@ -1967,6 +1992,17 @@ export default function HomePage() {
     !error &&
     !isProcessing;
 
+  const showPrimaryUploadCta =
+    !!file &&
+    isSignedIn &&
+    authLoaded &&
+    (usage == null || usage.minutesRemaining > 0) &&
+    !preflightUploadActive &&
+    !preflightReadyHint &&
+    !isProcessing &&
+    !error &&
+    (uploadTrigger === 0 || preflightTerminalFailed);
+
   const showPrimaryGenerateCta =
     !generateDisabled &&
     preflightReadyHint &&
@@ -1974,15 +2010,36 @@ export default function HomePage() {
     !error &&
     !autoClipStartPending;
 
-  let generateButtonLabel = "Generate Clips";
+  /** Bright retry after a failed auto-generation (upload already succeeded). */
+  const showPrimaryGenRetryCta =
+    !generateDisabled &&
+    preflightReadyHint &&
+    !preflightTerminalFailed &&
+    !!error &&
+    !isProcessing;
+
+  const showPrimaryCta =
+    showPrimaryUploadCta ||
+    showPrimaryGenerateCta ||
+    showPrimaryGenRetryCta;
+
+  const uploadPhaseButtonLabel =
+    uploadTrigger > 0 &&
+    !preflightReadyHint &&
+    !preflightTerminalFailed &&
+    (preflightUploadActive || mustWaitForPreflightGate);
+
+  let generateButtonLabel = "Upload Video";
   if (!file) {
-    generateButtonLabel = "Select a video first";
+    generateButtonLabel = "Choose a video first";
   } else if (!authLoaded) {
     generateButtonLabel = "Loading account...";
   } else if (!isSignedIn) {
     generateButtonLabel = "Sign in to generate";
   } else if (usage != null && usage.minutesRemaining <= 0) {
     generateButtonLabel = "No minutes remaining";
+  } else if (uploadPhaseButtonLabel) {
+    generateButtonLabel = "Uploading video...";
   } else if (isProcessing) {
     if (preflightUploadActive) {
       generateButtonLabel = uploadProgress
@@ -1997,14 +2054,16 @@ export default function HomePage() {
     } else {
       generateButtonLabel = "Processing...";
     }
-  } else if (mustWaitForPreflightGate) {
-    generateButtonLabel = "Preparing video...";
+  } else if (preflightReadyHint && error && !isProcessing) {
+    generateButtonLabel = "Generate Clips";
   } else if (
     preflightReadyHint &&
     !preflightUploadActive &&
     !error
   ) {
     generateButtonLabel = "Starting clip generation…";
+  } else if (preflightTerminalFailed) {
+    generateButtonLabel = "Upload Video";
   }
 
   return (
@@ -2488,96 +2547,95 @@ export default function HomePage() {
                   )}
                 </div>
 
-                {/* Settings Row */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-sm text-gray-400 mb-1.5">
-                      Platform
-                    </label>
-                    <select
-                      value={platform}
-                      onChange={(e) => setPlatform(e.target.value as Platform)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-purple-500"
-                    >
-                      {(Object.entries(PLATFORM_LABELS) as [Platform, string][]).map(
-                        ([val, label]) => (
-                          <option key={val} value={val}>
-                            {label}
-                          </option>
-                        )
-                      )}
-                    </select>
-                  </div>
+                {/* Platform, goal, plan + recommended clip settings (single card) */}
+                <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-4 space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1.5">
+                        Platform
+                      </label>
+                      <select
+                        value={platform}
+                        onChange={(e) => setPlatform(e.target.value as Platform)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-purple-500"
+                      >
+                        {(Object.entries(PLATFORM_LABELS) as [Platform, string][]).map(
+                          ([val, label]) => (
+                            <option key={val} value={val}>
+                              {label}
+                            </option>
+                          )
+                        )}
+                      </select>
+                    </div>
 
-                  <div>
-                    <label className="block text-sm text-gray-400 mb-1.5">
-                      Goal
-                    </label>
-                    <select
-                      value={goal}
-                      onChange={(e) => setGoal(e.target.value as Goal)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-purple-500"
-                    >
-                      {(Object.entries(GOAL_LABELS) as [Goal, string][]).map(
-                        ([val, label]) => (
-                          <option key={val} value={val}>
-                            {label}
-                          </option>
-                        )
-                      )}
-                    </select>
-                    <p className="text-[11px] sm:text-xs text-gray-500 mt-2 leading-snug">
-                      {goal === "growth"
-                        ? "30–45s clips for faster social growth."
-                        : "60–90s clips for deeper, monetizable content."}
-                    </p>
-                  </div>
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1.5">
+                        Goal
+                      </label>
+                      <select
+                        value={goal}
+                        onChange={(e) => setGoal(e.target.value as Goal)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-purple-500"
+                      >
+                        {(Object.entries(GOAL_LABELS) as [Goal, string][]).map(
+                          ([val, label]) => (
+                            <option key={val} value={val}>
+                              {label}
+                            </option>
+                          )
+                        )}
+                      </select>
+                      <p className="text-[11px] sm:text-xs text-gray-500 mt-2 leading-snug">
+                        {goal === "growth"
+                          ? "30–45s clips for faster social growth."
+                          : "60–90s clips for deeper, monetizable content."}
+                      </p>
+                    </div>
 
-                  <div>
-                    <label className="block text-sm text-gray-400 mb-1.5">
-                      Plan
-                    </label>
-                    <div className="flex items-center gap-3 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5">
-                      <span className={`text-sm font-medium ${
-                        plan === "power"
-                          ? "text-amber-400"
-                          : plan === "pro"
-                            ? "text-purple-400"
-                            : "text-gray-300"
-                      }`}>
-                        {plan === "power" ? "Power" : plan === "pro" ? "Pro" : "Free"}
-                      </span>
-                      {usage && (
-                        <span className="text-xs text-gray-500">
-                          {Math.round(usage.minutesUsed)}/{usage.minutesLimit} min
+                    <div>
+                      <label className="block text-sm text-gray-400 mb-1.5">
+                        Plan
+                      </label>
+                      <div className="flex items-center gap-3 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5">
+                        <span className={`text-sm font-medium ${
+                          plan === "power"
+                            ? "text-amber-400"
+                            : plan === "pro"
+                              ? "text-purple-400"
+                              : "text-gray-300"
+                        }`}>
+                          {plan === "power" ? "Power" : plan === "pro" ? "Pro" : "Free"}
                         </span>
-                      )}
-                      {plan !== "power" && (
-                        <button
-                          type="button"
-                          onClick={() => handleUpgrade(plan === "free" ? "pro" : "power")}
-                          title={
-                            plan === "free"
-                              ? `${PRO_POSITIONING.tagline}. ${PRO_POSITIONING.valuePitch}`
-                              : `${POWER_POSITIONING.tagline}. ${POWER_POSITIONING.valuePitch}`
-                          }
-                          className="ml-auto text-xs text-purple-400 hover:text-purple-300 underline underline-offset-2"
-                        >
-                          {plan === "free" ? "Upgrade to Pro" : "Upgrade to Power"}
-                        </button>
+                        {usage && (
+                          <span className="text-xs text-gray-500">
+                            {Math.round(usage.minutesUsed)}/{usage.minutesLimit} min
+                          </span>
+                        )}
+                        {plan !== "power" && (
+                          <button
+                            type="button"
+                            onClick={() => handleUpgrade(plan === "free" ? "pro" : "power")}
+                            title={
+                              plan === "free"
+                                ? `${PRO_POSITIONING.tagline}. ${PRO_POSITIONING.valuePitch}`
+                                : `${POWER_POSITIONING.tagline}. ${POWER_POSITIONING.valuePitch}`
+                            }
+                            className="ml-auto text-xs text-purple-400 hover:text-purple-300 underline underline-offset-2"
+                          >
+                            {plan === "free" ? "Upgrade to Pro" : "Upgrade to Power"}
+                          </button>
+                        )}
+                      </div>
+                      {plan === "free" && (
+                        <p className="text-xs text-gray-600 mt-2 leading-relaxed">
+                          <span className="text-gray-500">{PRO_POSITIONING.tagline}.</span>{" "}
+                          Pro is for consistent posting — not just more minutes, but a real weekly workflow with freedom to refine clips.
+                        </p>
                       )}
                     </div>
-                    {plan === "free" && (
-                      <p className="text-xs text-gray-600 mt-2 leading-relaxed">
-                        <span className="text-gray-500">{PRO_POSITIONING.tagline}.</span>{" "}
-                        Pro is for consistent posting — not just more minutes, but a real weekly workflow with freedom to refine clips.
-                      </p>
-                    )}
                   </div>
-                </div>
 
-                {/* Recommended Settings */}
-                <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-4">
                   <div className="text-sm text-gray-400 mb-2">
                     Recommended settings for{" "}
                     <span className="text-purple-400">
@@ -2654,19 +2712,29 @@ export default function HomePage() {
                   </div>
                 )}
 
-                {/* Generate Button */}
+                {/* Upload / generate CTA */}
                 <button
                   type="button"
-                  onClick={handleGenerate}
+                  onClick={() => {
+                    if (preflightReadyHint && error && !isProcessing) {
+                      void handleGenerate();
+                      return;
+                    }
+                    if (!preflightReadyHint || preflightTerminalFailed) {
+                      handleUploadVideoClick();
+                      return;
+                    }
+                    void handleGenerate();
+                  }}
                   disabled={generateDisabled}
                   className={`w-full py-4 rounded-xl font-semibold text-lg transition-all border ${
-                    showPrimaryGenerateCta
+                    showPrimaryCta
                       ? "bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20 border-transparent"
                       : "bg-gray-800/90 text-gray-500 border-gray-700/80 shadow-none"
                   } ${
                     generateDisabled
                       ? "cursor-not-allowed opacity-50"
-                      : !showPrimaryGenerateCta
+                      : !showPrimaryCta
                         ? "cursor-pointer text-gray-300 border-gray-600/80 hover:bg-gray-800/95 opacity-100"
                         : "cursor-pointer opacity-100"
                   }`}
