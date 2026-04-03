@@ -63,6 +63,13 @@ export interface JobRecord {
    */
   scanStartSec?: number;
   scanEndSec?: number;
+  /**
+   * When the browser uploaded only a 60-minute segment: offset on the original timeline for clip times
+   * (seconds). Set with `originalSourceDurationSec` at finalize.
+   */
+  timelineOffsetSec?: number;
+  /** Full source length (seconds) before client-side trim; used for scanInfo minutes. */
+  originalSourceDurationSec?: number;
   error?: string;
   /** Present when status === "completed" */
   result?: ProcessResponse;

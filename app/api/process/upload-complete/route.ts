@@ -62,9 +62,19 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let body: { jobId?: string; longVideoSegment?: string };
+    let body: {
+      jobId?: string;
+      longVideoSegment?: string;
+      clientPretrimmedSegment?: boolean;
+      originalDurationSec?: number;
+    };
     try {
-      body = (await req.json()) as { jobId?: string; longVideoSegment?: string };
+      body = (await req.json()) as {
+        jobId?: string;
+        longVideoSegment?: string;
+        clientPretrimmedSegment?: boolean;
+        originalDurationSec?: number;
+      };
     } catch {
       return jsonError("Invalid JSON body", 400);
     }
@@ -78,6 +88,13 @@ export async function POST(req: NextRequest) {
     ) {
       longVideoSegment = rawSeg;
     }
+
+    const clientPretrimmedSegment = body.clientPretrimmedSegment === true;
+    const originalDurationSec =
+      typeof body.originalDurationSec === "number" &&
+      Number.isFinite(body.originalDurationSec)
+        ? body.originalDurationSec
+        : undefined;
 
     const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
     if (!jobId || !UUID_RE.test(jobId)) {
@@ -153,6 +170,8 @@ export async function POST(req: NextRequest) {
         videoPath,
         rec,
         longVideoSegment,
+        clientPretrimmedSegment,
+        originalDurationSec,
         onTimingMs: (phase, ms) => {
           if (phase === "getVideoDuration") durationMs = ms;
           if (phase === "getProcessingBudget") budgetMs = ms;

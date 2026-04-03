@@ -20,6 +20,9 @@ async function failJob(rec: JobRecord, error: string): Promise<void> {
  * After `uploads/{jobId}.mp4` exists locally: ffprobe, budget, transition to queued.
  * Returns `null` on success (caller should return 202), or an error `NextResponse`.
  */
+/** Allowed difference (seconds) between probed upload length and expected window length. */
+export const CLIENT_PRETRIM_DURATION_TOLERANCE_SEC = 30;
+
 export async function finalizeJobAfterLocalVideoWritten(params: {
   jobId: string;
   userId: string;
@@ -27,13 +30,26 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   rec: JobRecord;
   /** When the source is longer than 60 minutes, which 60-minute window to process. */
   longVideoSegment?: LongVideoSegment;
+  /** Browser trimmed to the 60-minute window before upload; server validates length vs selection. */
+  clientPretrimmedSegment?: boolean;
+  /** Required with `clientPretrimmedSegment`: full source duration (seconds) from client metadata. */
+  originalDurationSec?: number;
   /** Optional: R2 upload-complete instrumentation only; does not change behavior. */
   onTimingMs?: (
     phase: "getVideoDuration" | "getProcessingBudget",
     ms: number
   ) => void;
 }): Promise<NextResponse | null> {
-  const { jobId, userId, videoPath, rec, longVideoSegment, onTimingMs } = params;
+  const {
+    jobId,
+    userId,
+    videoPath,
+    rec,
+    longVideoSegment,
+    clientPretrimmedSegment,
+    originalDurationSec,
+    onTimingMs,
+  } = params;
 
   let t = performance.now();
   const durationSec = await getVideoDuration(videoPath);
@@ -49,6 +65,111 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
     );
   }
   const durationMin = durationSec / 60;
+
+  if (clientPretrimmedSegment) {
+    if (
+      originalDurationSec == null ||
+      !Number.isFinite(originalDurationSec) ||
+      originalDurationSec <= MAX_PROCESSING_WINDOW_SEC
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "Invalid original duration for pre-trimmed upload. Refresh and try again.",
+        },
+        { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+    if (!longVideoSegment) {
+      return NextResponse.json(
+        {
+          error:
+            "Missing segment choice for pre-trimmed long video. Choose Beginning, Middle, or End.",
+        },
+        { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+    const win = computeScanWindowSec(originalDurationSec, longVideoSegment);
+    if (!win) {
+      return NextResponse.json(
+        { error: "Could not compute scan window for pre-trimmed upload." },
+        { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+    const expectedLenSec = win.endSec - win.startSec;
+    if (
+      Math.abs(durationSec - expectedLenSec) >
+      CLIENT_PRETRIM_DURATION_TOLERANCE_SEC
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            "Uploaded segment length does not match the selected section. Try trimming again or use full upload.",
+        },
+        { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+
+    const windowMin = durationSec / 60;
+    const scanStartSec = win.startSec;
+    const scanEndSec = win.endSec;
+
+    t = performance.now();
+    const budget = await getProcessingBudget(userId, windowMin);
+    onTimingMs?.("getProcessingBudget", performance.now() - t);
+    console.log(`[Usage] User plan: ${budget.usage.plan}`);
+    console.log(
+      `[Usage] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
+    );
+    console.log(
+      `[Usage] Client pre-trim: probed ${durationMin.toFixed(2)} min upload; original source ${(originalDurationSec / 60).toFixed(2)} min`
+    );
+    console.log(
+      `[Usage] Scan window (original timeline): ${scanStartSec.toFixed(1)}s–${scanEndSec.toFixed(1)}s`
+    );
+    console.log(
+      `[Usage] Scan budget: ${budget.effectiveScanMinutes.toFixed(2)} min (capped=${budget.capped})`
+    );
+
+    if (!budget.allowed) {
+      await failJob(
+        rec,
+        budget.blockedMessage ?? "No minutes remaining this month."
+      );
+      return NextResponse.json(
+        {
+          error: budget.blockedMessage ?? "No minutes remaining this month.",
+          usageLimitError: true,
+          usage: {
+            minutesUsed: budget.usage.minutesUsed,
+            minutesLimit: budget.usage.minutesLimit,
+            minutesRemaining: budget.usage.minutesRemaining,
+          },
+        },
+        { status: 403, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+
+    const latestPre = await readJobRecord(jobId);
+    if (!latestPre || latestPre.status !== "awaiting_upload") {
+      return NextResponse.json(
+        { error: "Job state changed; try again." },
+        { status: 409, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+
+    await writeJobRecord(
+      patchJobRecord(latestPre, {
+        status: "queued",
+        scanStartSec,
+        scanEndSec,
+        timelineOffsetSec: win.startSec,
+        originalSourceDurationSec: originalDurationSec,
+      })
+    );
+    logE2E(jobId, "job_enqueued");
+    return null;
+  }
 
   const window =
     durationSec <= MAX_PROCESSING_WINDOW_SEC

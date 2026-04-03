@@ -88,6 +88,30 @@ async function getBudgetAndExtractOptsForJob(params: {
   if (!Number.isFinite(fullDurationSec) || fullDurationSec <= 0) {
     throw new Error("Could not read video duration.");
   }
+
+  if (
+    rec?.originalSourceDurationSec != null &&
+    rec?.timelineOffsetSec != null
+  ) {
+    const windowLenSec = fullDurationSec;
+    const windowMin = windowLenSec / 60;
+    const budget = await getProcessingBudget(userId, windowMin);
+    const effectiveScanSec = Math.min(
+      budget.effectiveScanMinutes * 60,
+      windowLenSec
+    );
+    const extractOpts: { startSec?: number; maxDurationSec: number } = {
+      maxDurationSec: effectiveScanSec,
+    };
+    return {
+      budget,
+      extractOpts,
+      fullDurationSec,
+      timelineOffsetSec: rec.timelineOffsetSec,
+      fullDurationMin: rec.originalSourceDurationSec / 60,
+    };
+  }
+
   const { startSec, endSec } = getJobScanBounds(rec, fullDurationSec);
   const windowLenSec = endSec - startSec;
   const windowMin = windowLenSec / 60;

@@ -35,7 +35,14 @@ export function patchJobRecord(
   patch: Partial<
     Pick<
       JobRecord,
-      "status" | "error" | "result" | "stage" | "scanStartSec" | "scanEndSec"
+      | "status"
+      | "error"
+      | "result"
+      | "stage"
+      | "scanStartSec"
+      | "scanEndSec"
+      | "timelineOffsetSec"
+      | "originalSourceDurationSec"
     >
   >
 ): JobRecord {

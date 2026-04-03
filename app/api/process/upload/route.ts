@@ -63,6 +63,15 @@ export async function POST(req: NextRequest) {
       longVideoSegment = segRaw;
     }
 
+    const ptrim = formData.get("clientPretrimmedSegment");
+    const clientPretrimmedSegment =
+      ptrim === "true" || ptrim === "1";
+    const origRaw = formData.get("originalDurationSec");
+    const originalDurationSec =
+      typeof origRaw === "string" && origRaw.trim().length > 0
+        ? Number(origRaw)
+        : undefined;
+
     if (!file) {
       return jsonError("No file uploaded", 400);
     }
@@ -96,6 +105,11 @@ export async function POST(req: NextRequest) {
       videoPath,
       rec,
       longVideoSegment,
+      clientPretrimmedSegment,
+      originalDurationSec:
+        originalDurationSec != null && Number.isFinite(originalDurationSec)
+          ? originalDurationSec
+          : undefined,
     });
     if (finalize) return finalize;
 

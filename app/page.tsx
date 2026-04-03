@@ -16,6 +16,10 @@ import {
   MAX_PROCESSING_WINDOW_SEC,
   type LongVideoSegment,
 } from "@/lib/scan-window";
+import {
+  trimLocalVideoToSegment,
+  shouldAttemptClientTrim,
+} from "@/lib/client-trim-segment";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -458,6 +462,9 @@ export default function HomePage() {
   const [longVideoSegment, setLongVideoSegment] = useState<LongVideoSegment | null>(
     null
   );
+  /** Set after client-side ffmpeg trim for long videos (smaller upload). */
+  const [clientTrimmedFile, setClientTrimmedFile] = useState<File | null>(null);
+  const [clientTrimBusy, setClientTrimBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Incremented when the user taps "Upload Video" so preflight only runs after an explicit action. */
@@ -504,6 +511,13 @@ export default function HomePage() {
     setUploadTrigger(0);
   }, [file]);
 
+  useEffect(() => {
+    setClientTrimmedFile(null);
+  }, [file, longVideoSegment]);
+
+  const fileForUpload =
+    file != null ? (clientTrimmedFile ?? file) : null;
+
   /** Background init + R2 PUT only (no upload-complete) so upload overlaps user choices. */
   useEffect(() => {
     const durationReady =
@@ -515,6 +529,7 @@ export default function HomePage() {
 
     if (
       !file ||
+      !fileForUpload ||
       !isSignedIn ||
       !authLoaded ||
       uploadTrigger === 0 ||
@@ -668,7 +683,7 @@ export default function HomePage() {
           jobId,
           platform,
           goal,
-          fileKey: fileKeyFromFile(file),
+          fileKey: fileKeyFromFile(fileForUpload),
         };
         preflightPutPromiseRef.current = null;
         setPreflightUploadActive(false);
@@ -676,7 +691,7 @@ export default function HomePage() {
         return;
       }
 
-      const fk = fileKeyFromFile(file);
+      const fk = fileKeyFromFile(fileForUpload);
       preflightSnapshotRef.current = {
         kind: "running",
         jobId,
@@ -695,7 +710,7 @@ export default function HomePage() {
       uploadStartMsRef.current = 0;
       setUploadProgress({
         loaded: 0,
-        total: file.size,
+        total: fileForUpload.size,
         percent: 0,
         etaSec: null,
       });
@@ -703,7 +718,7 @@ export default function HomePage() {
       try {
         const putRes = await putFileToPresignedUrlWithProgress(
           r2UploadUrl,
-          file,
+          fileForUpload,
           r2ContentType,
           {
             onProgress: (p) => setUploadProgress(p),
@@ -758,6 +773,7 @@ export default function HomePage() {
     };
   }, [
     file,
+    fileForUpload,
     platform,
     goal,
     isSignedIn,
@@ -766,6 +782,7 @@ export default function HomePage() {
     uploadTrigger,
     videoDurationSec,
     longVideoSegment,
+    clientTrimmedFile,
   ]);
 
   /** After Stripe redirects back, Clerk session may still have old `publicMetadata` until reload */
@@ -1292,11 +1309,12 @@ export default function HomePage() {
     setUploadProgress(null);
     setUploadTrigger(0);
     setFile(null);
+    setClientTrimmedFile(null);
     setError(null);
     if (inputRef.current) inputRef.current.value = "";
   }, []);
 
-  const handleUploadVideoClick = useCallback(() => {
+  const handleUploadVideoClick = useCallback(async () => {
     if (!file || !authLoaded || !isSignedIn) return;
     const durationReady =
       videoDurationSec != null && videoDurationSec > 0;
@@ -1315,6 +1333,32 @@ export default function HomePage() {
       setPreflightReadyHint(false);
       setPreflightTerminalFailed(false);
       setUploadProgress(null);
+    }
+    if (!isLong) {
+      setClientTrimmedFile(null);
+    } else if (
+      longVideoSegment &&
+      videoDurationSec != null &&
+      shouldAttemptClientTrim(file, isLong)
+    ) {
+      setClientTrimBusy(true);
+      try {
+        const blob = await trimLocalVideoToSegment({
+          file,
+          segment: longVideoSegment,
+          originalDurationSec: videoDurationSec,
+        });
+        setClientTrimmedFile(
+          new File([blob], file.name, { type: "video/mp4" })
+        );
+      } catch (e) {
+        console.warn("Client trim failed; uploading full file instead", e);
+        setClientTrimmedFile(null);
+      } finally {
+        setClientTrimBusy(false);
+      }
+    } else {
+      setClientTrimmedFile(null);
     }
     setUploadTrigger((n) => n + 1);
   }, [
@@ -1428,7 +1472,8 @@ export default function HomePage() {
         setStatusIdx(-1);
         setUploadProgress(null);
 
-        const fileKey = fileKeyFromFile(file);
+        const uploadForJob = (clientTrimmedFile ?? file) as File;
+        const fileKey = fileKeyFromFile(uploadForJob);
         const snap0 = preflightSnapshotRef.current;
         const fastR2 =
           (snap0.kind === "r2_put_done" || snap0.kind === "running") &&
@@ -1453,10 +1498,17 @@ export default function HomePage() {
           setPreflightTerminalFailed(false);
         }
 
-        const uploadCompletePayload = (jid: string) =>
-          isLongVideo && longVideoSegment
-            ? { jobId: jid, longVideoSegment }
-            : { jobId: jid };
+        const uploadCompletePayload = (jid: string) => {
+          const base: Record<string, unknown> =
+            isLongVideo && longVideoSegment
+              ? { jobId: jid, longVideoSegment }
+              : { jobId: jid };
+          if (clientTrimmedFile) {
+            base.clientPretrimmedSegment = true;
+            base.originalDurationSec = videoDurationSec;
+          }
+          return base;
+        };
 
         const finalizeUploadResponse = async (
           raw: string,
@@ -1628,10 +1680,14 @@ export default function HomePage() {
 
           const buildUploadForm = () => {
             const form = new FormData();
-            form.append("file", file);
+            form.append("file", uploadForJob);
             form.append("jobId", jobId);
             if (isLongVideo && longVideoSegment) {
               form.append("longVideoSegment", longVideoSegment);
+            }
+            if (clientTrimmedFile && videoDurationSec != null) {
+              form.append("clientPretrimmedSegment", "true");
+              form.append("originalDurationSec", String(videoDurationSec));
             }
             return form;
           };
@@ -1639,7 +1695,7 @@ export default function HomePage() {
           uploadStartMsRef.current = 0;
           setUploadProgress({
             loaded: 0,
-            total: file.size,
+            total: uploadForJob.size,
             percent: 0,
             etaSec: null,
           });
@@ -1663,7 +1719,7 @@ export default function HomePage() {
               uploadStartMsRef.current = 0;
               setUploadProgress({
                 loaded: 0,
-                total: file.size,
+                total: uploadForJob.size,
                 percent: 0,
                 etaSec: null,
               });
@@ -1747,10 +1803,14 @@ export default function HomePage() {
 
         const buildUploadForm = () => {
           const form = new FormData();
-          form.append("file", file);
+          form.append("file", uploadForJob);
           form.append("jobId", jobId);
           if (isLongVideo && longVideoSegment) {
             form.append("longVideoSegment", longVideoSegment);
+          }
+          if (clientTrimmedFile && videoDurationSec != null) {
+            form.append("clientPretrimmedSegment", "true");
+            form.append("originalDurationSec", String(videoDurationSec));
           }
           return form;
         };
@@ -1853,7 +1913,7 @@ export default function HomePage() {
           uploadStartMsRef.current = 0;
           setUploadProgress({
             loaded: 0,
-            total: file.size,
+            total: uploadForJob.size,
             percent: 0,
             etaSec: null,
           });
@@ -1861,7 +1921,7 @@ export default function HomePage() {
 
           let putRes = await putFileToPresignedUrlWithProgress(
             r2UploadUrl,
-            file,
+            uploadForJob,
             r2ContentType,
             {
               onProgress: (p) => setUploadProgress(p),
@@ -1914,7 +1974,7 @@ export default function HomePage() {
           uploadStartMsRef.current = 0;
           setUploadProgress({
             loaded: 0,
-            total: file.size,
+            total: uploadForJob.size,
             percent: 0,
             etaSec: null,
           });
@@ -1938,7 +1998,7 @@ export default function HomePage() {
               uploadStartMsRef.current = 0;
               setUploadProgress({
                 loaded: 0,
-                total: file.size,
+                total: uploadForJob.size,
                 percent: 0,
                 etaSec: null,
               });
@@ -2068,6 +2128,7 @@ export default function HomePage() {
   const generateDisabled =
     !file ||
     isProcessing ||
+    clientTrimBusy ||
     (usage != null && usage.minutesRemaining <= 0) ||
     mustWaitForPreflightGate ||
     (file && !isSignedIn) ||
@@ -2131,6 +2192,8 @@ export default function HomePage() {
     generateButtonLabel = "Reading video…";
   } else if (isLongVideo && !longVideoSegment) {
     generateButtonLabel = "Choose a 60-minute section";
+  } else if (clientTrimBusy) {
+    generateButtonLabel = "Preparing segment…";
   } else if (uploadPhaseButtonLabel) {
     generateButtonLabel = "Uploading video...";
   } else if (isProcessing) {
