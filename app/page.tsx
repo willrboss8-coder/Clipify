@@ -24,6 +24,10 @@ import {
   trimLocalVideoToSegment,
   shouldAttemptClientTrim,
 } from "@/lib/client-trim-segment";
+import {
+  uploadFileToR2WithProgress,
+  type UploadProgressState,
+} from "@/lib/r2-client-upload";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -156,13 +160,6 @@ function logUiE2e(
   }
 }
 
-interface UploadProgressState {
-  loaded: number;
-  total: number;
-  percent: number;
-  etaSec: number | null;
-}
-
 function fmtBytes(n: number): string {
   if (!Number.isFinite(n) || n < 0) return "—";
   if (n < 1024) return `${Math.round(n)} B`;
@@ -223,70 +220,6 @@ function postMultipartWithUploadProgress(
     xhr.onerror = () => reject(new Error("Network error"));
     xhr.onabort = () => reject(new Error("Upload aborted"));
     xhr.send(formData);
-  });
-}
-
-/**
- * PUT file to a presigned R2 URL (cross-origin; do not send cookies).
- * Progress events mirror multipart upload.
- */
-function putFileToPresignedUrlWithProgress(
-  uploadUrl: string,
-  file: File,
-  contentType: string,
-  opts: {
-    onProgress: (p: UploadProgressState) => void;
-    uploadStartMsRef: MutableRefObject<number>;
-    /** When set, caller can abort() to cancel (e.g. preflight invalidation). */
-    xhrRefForAbort?: MutableRefObject<XMLHttpRequest | null>;
-  }
-): Promise<{ ok: boolean; status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = xhr;
-    xhr.open("PUT", uploadUrl);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && e.total > 0) {
-        if (opts.uploadStartMsRef.current === 0) {
-          opts.uploadStartMsRef.current = Date.now();
-        }
-        const loaded = e.loaded;
-        const total = e.total;
-        const percent = Math.min(100, Math.round((loaded / total) * 100));
-        const elapsedSec = (Date.now() - opts.uploadStartMsRef.current) / 1000;
-        const rate = elapsedSec > 0 && loaded > 0 ? loaded / elapsedSec : 0;
-        const etaSec =
-          rate > 0 && total > loaded
-            ? Math.max(0, Math.round((total - loaded) / rate))
-            : null;
-        opts.onProgress({ loaded, total, percent, etaSec });
-      } else {
-        opts.onProgress({
-          loaded: e.loaded,
-          total: file.size,
-          percent: 0,
-          etaSec: null,
-        });
-      }
-    };
-    xhr.onload = () => {
-      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
-      resolve({
-        ok: xhr.status >= 200 && xhr.status < 300,
-        status: xhr.status,
-        body: xhr.responseText,
-      });
-    };
-    xhr.onerror = () => {
-      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
-      reject(new Error("Network error"));
-    };
-    xhr.onabort = () => {
-      if (opts.xhrRefForAbort) opts.xhrRefForAbort.current = null;
-      reject(new Error("Upload aborted"));
-    };
-    xhr.setRequestHeader("Content-Type", contentType);
-    xhr.send(file);
   });
 }
 
@@ -408,6 +341,8 @@ export default function HomePage() {
   const [preflightTerminalFailed, setPreflightTerminalFailed] = useState(false);
   const preflightRunIdRef = useRef(0);
   const preflightPutXhrRef = useRef<XMLHttpRequest | null>(null);
+  /** Aborts in-flight R2 multipart (per-part XHR); single-PUT still uses preflightPutXhrRef. */
+  const preflightMultipartAbortRef = useRef<AbortController | null>(null);
   const preflightPutPromiseRef = useRef<Promise<void> | null>(null);
   type PreflightSnapshot =
     | { kind: "none" }
@@ -547,6 +482,8 @@ export default function HomePage() {
       preflightRunIdRef.current += 1;
       preflightPutXhrRef.current?.abort();
       preflightPutXhrRef.current = null;
+      preflightMultipartAbortRef.current?.abort();
+      preflightMultipartAbortRef.current = null;
       preflightPutPromiseRef.current = null;
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
@@ -724,17 +661,21 @@ export default function HomePage() {
         etaSec: null,
       });
 
+      const multipartAbort = new AbortController();
+      preflightMultipartAbortRef.current = multipartAbort;
+
       try {
-        const putRes = await putFileToPresignedUrlWithProgress(
-          r2UploadUrl,
-          fileForUpload,
-          r2ContentType,
-          {
-            onProgress: (p) => setUploadProgress(p),
-            uploadStartMsRef,
-            xhrRefForAbort: preflightPutXhrRef,
-          }
-        );
+        const putRes = await uploadFileToR2WithProgress({
+          file: fileForUpload,
+          jobId,
+          contentType: r2ContentType,
+          singlePutUrl: r2UploadUrl,
+          fileKey: fk,
+          onProgress: (p) => setUploadProgress(p),
+          uploadStartMsRef,
+          xhrRefForAbort: preflightPutXhrRef,
+          signal: multipartAbort.signal,
+        });
         if (preflightRunIdRef.current !== myId) return;
         if (!putRes.ok) {
           preflightSnapshotRef.current = { kind: "error" };
@@ -753,7 +694,10 @@ export default function HomePage() {
       } catch (e: unknown) {
         if (preflightRunIdRef.current !== myId) return;
         const msg = e instanceof Error ? e.message : "";
-        if (msg === "Upload aborted") {
+        const isAbort =
+          msg === "Upload aborted" ||
+          (e instanceof DOMException && e.name === "AbortError");
+        if (isAbort) {
           preflightSnapshotRef.current = { kind: "none" };
           setPreflightTerminalFailed(false);
         } else {
@@ -761,6 +705,7 @@ export default function HomePage() {
           setPreflightTerminalFailed(true);
         }
       } finally {
+        preflightMultipartAbortRef.current = null;
         putResolve?.();
         setPreflightUploadActive(false);
         if (preflightRunIdRef.current === myId) {
@@ -773,6 +718,8 @@ export default function HomePage() {
       preflightRunIdRef.current += 1;
       preflightPutXhrRef.current?.abort();
       preflightPutXhrRef.current = null;
+      preflightMultipartAbortRef.current?.abort();
+      preflightMultipartAbortRef.current = null;
       preflightPutPromiseRef.current = null;
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
@@ -1310,6 +1257,8 @@ export default function HomePage() {
     preflightRunIdRef.current += 1;
     preflightPutXhrRef.current?.abort();
     preflightPutXhrRef.current = null;
+    preflightMultipartAbortRef.current?.abort();
+    preflightMultipartAbortRef.current = null;
     preflightPutPromiseRef.current = null;
     preflightSnapshotRef.current = { kind: "none" };
     setPreflightUploadActive(false);
@@ -1337,6 +1286,8 @@ export default function HomePage() {
       preflightRunIdRef.current += 1;
       preflightPutXhrRef.current?.abort();
       preflightPutXhrRef.current = null;
+      preflightMultipartAbortRef.current?.abort();
+      preflightMultipartAbortRef.current = null;
       preflightPutPromiseRef.current = null;
       preflightSnapshotRef.current = { kind: "none" };
       setPreflightUploadActive(false);
@@ -1508,6 +1459,8 @@ export default function HomePage() {
           preflightRunIdRef.current += 1;
           preflightPutXhrRef.current?.abort();
           preflightPutXhrRef.current = null;
+          preflightMultipartAbortRef.current?.abort();
+          preflightMultipartAbortRef.current = null;
           preflightPutPromiseRef.current = null;
           preflightSnapshotRef.current = { kind: "none" };
           setPreflightUploadActive(false);
@@ -1936,15 +1889,15 @@ export default function HomePage() {
           });
           logUiE2e("upload_request_started", uiE2eT0, jobId);
 
-          let putRes = await putFileToPresignedUrlWithProgress(
-            r2UploadUrl,
-            uploadForJob,
-            r2ContentType,
-            {
-              onProgress: (p) => setUploadProgress(p),
-              uploadStartMsRef,
-            }
-          );
+          let putRes = await uploadFileToR2WithProgress({
+            file: uploadForJob,
+            jobId,
+            contentType: r2ContentType,
+            singlePutUrl: r2UploadUrl,
+            fileKey,
+            onProgress: (p) => setUploadProgress(p),
+            uploadStartMsRef,
+          });
 
           if (!putRes.ok) {
             setUploadProgress(null);

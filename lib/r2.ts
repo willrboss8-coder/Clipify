@@ -3,12 +3,19 @@ import path from "path";
 import { mkdir } from "fs/promises";
 import { pipeline } from "stream/promises";
 import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
+  UploadPartCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  R2_MULTIPART_CHUNK_BYTES,
+} from "@/lib/r2-upload-config";
 
 /** Presigned PUT lifetime (seconds). */
 const DEFAULT_PUT_EXPIRES_SEC = 3600;
@@ -139,4 +146,126 @@ export async function downloadJobSourceToFile(
   await mkdir(path.dirname(destPath), { recursive: true });
   const writeStream = createWriteStream(destPath);
   await pipeline(body as NodeJS.ReadableStream, writeStream);
+}
+
+export interface MultipartInitResult {
+  uploadId: string;
+  key: string;
+  bucket: string;
+  chunkSizeBytes: number;
+}
+
+/**
+ * Start an S3 multipart upload for the job source object (same final key as single PUT).
+ */
+export async function createMultipartUploadForJobSource(
+  jobId: string
+): Promise<MultipartInitResult> {
+  const bucket = requireEnv("R2_BUCKET");
+  const key = r2SourceObjectKey(jobId);
+  const client = getS3ClientForR2();
+  const out = await client.send(
+    new CreateMultipartUploadCommand({
+      Bucket: bucket,
+      Key: key,
+      ContentType: "video/mp4",
+    })
+  );
+  if (!out.UploadId) {
+    throw new Error("CreateMultipartUpload did not return UploadId");
+  }
+  return {
+    uploadId: out.UploadId,
+    key,
+    bucket,
+    chunkSizeBytes: R2_MULTIPART_CHUNK_BYTES,
+  };
+}
+
+const PART_SIGN_EXPIRES_SEC = 3600;
+
+/**
+ * Presigned URL for one part (browser PUTs the raw bytes for that slice).
+ */
+export async function createPresignedUrlForUploadPart(
+  jobId: string,
+  uploadId: string,
+  partNumber: number
+): Promise<{ uploadUrl: string; expiresIn: number }> {
+  if (partNumber < 1 || partNumber > 10_000) {
+    throw new Error("Invalid part number");
+  }
+  const bucket = requireEnv("R2_BUCKET");
+  const key = r2SourceObjectKey(jobId);
+  const client = getS3ClientForR2();
+  const command = new UploadPartCommand({
+    Bucket: bucket,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: partNumber,
+  });
+  const expiresIn = PART_SIGN_EXPIRES_SEC;
+  const uploadUrl = await getSignedUrl(client, command, { expiresIn });
+  return { uploadUrl, expiresIn };
+}
+
+export interface CompletedPart {
+  PartNumber: number;
+  /** ETag from UploadPart response (quotes optional). */
+  ETag: string;
+}
+
+/**
+ * Finish multipart upload so the object matches a single PUT result for downstream HEAD/GET.
+ */
+export async function completeMultipartUploadForJobSource(
+  jobId: string,
+  uploadId: string,
+  parts: CompletedPart[]
+): Promise<void> {
+  const bucket = requireEnv("R2_BUCKET");
+  const key = r2SourceObjectKey(jobId);
+  const client = getS3ClientForR2();
+  const sorted = [...parts].sort((a, b) => a.PartNumber - b.PartNumber);
+  await client.send(
+    new CompleteMultipartUploadCommand({
+      Bucket: bucket,
+      Key: key,
+      UploadId: uploadId,
+      MultipartUpload: {
+        Parts: sorted.map((p) => ({
+          PartNumber: p.PartNumber,
+          ETag: normalizeEtagForComplete(p.ETag),
+        })),
+      },
+    })
+  );
+}
+
+function normalizeEtagForComplete(etag: string): string {
+  const t = etag.trim();
+  if (t.startsWith('"') && t.endsWith('"') && t.length >= 2) {
+    return t;
+  }
+  return `"${t.replace(/^"|"$/g, "")}"`;
+}
+
+export async function abortMultipartUploadForJobSource(
+  jobId: string,
+  uploadId: string
+): Promise<void> {
+  const bucket = requireEnv("R2_BUCKET");
+  const key = r2SourceObjectKey(jobId);
+  const client = getS3ClientForR2();
+  try {
+    await client.send(
+      new AbortMultipartUploadCommand({
+        Bucket: bucket,
+        Key: key,
+        UploadId: uploadId,
+      })
+    );
+  } catch {
+    /* best-effort */
+  }
 }
