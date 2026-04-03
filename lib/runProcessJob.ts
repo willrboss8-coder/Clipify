@@ -19,6 +19,7 @@ import {
 } from "@/lib/pipeline";
 import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 import { logE2E } from "@/lib/e2e-timing";
+import { getJobScanBounds } from "@/lib/scan-window";
 
 function logPipelineTiming(
   jobId: string,
@@ -69,6 +70,45 @@ export function isPipelineSplitTranscribe(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
+/** Scan budget + ffmpeg extract for the persisted window (or full file if unset). */
+async function getBudgetAndExtractOptsForJob(params: {
+  jobId: string;
+  userId: string;
+  videoPath: string;
+}): Promise<{
+  budget: ProcessingBudget;
+  extractOpts: { startSec?: number; maxDurationSec: number };
+  fullDurationSec: number;
+  timelineOffsetSec: number;
+  fullDurationMin: number;
+}> {
+  const { jobId, userId, videoPath } = params;
+  const rec = await readJobRecord(jobId);
+  const fullDurationSec = await getVideoDuration(videoPath);
+  if (!Number.isFinite(fullDurationSec) || fullDurationSec <= 0) {
+    throw new Error("Could not read video duration.");
+  }
+  const { startSec, endSec } = getJobScanBounds(rec, fullDurationSec);
+  const windowLenSec = endSec - startSec;
+  const windowMin = windowLenSec / 60;
+  const budget = await getProcessingBudget(userId, windowMin);
+  const effectiveScanSec = Math.min(
+    budget.effectiveScanMinutes * 60,
+    windowLenSec
+  );
+  const extractOpts: { startSec?: number; maxDurationSec: number } = {
+    maxDurationSec: effectiveScanSec,
+  };
+  if (startSec > 0) extractOpts.startSec = startSec;
+  return {
+    budget,
+    extractOpts,
+    fullDurationSec,
+    timelineOffsetSec: startSec,
+    fullDurationMin: fullDurationSec / 60,
+  };
+}
+
 interface PostTranscribeTimings {
   momentSelectionSec: number;
   clip1RenderSec: number;
@@ -83,7 +123,10 @@ async function executePostTranscribeStages(params: {
   goal: string;
   transcript: Transcript;
   budget: ProcessingBudget;
+  /** Full source length (minutes) for scanInfo. */
   durationMin: number;
+  /** Offsets clip times to absolute source timeline. */
+  timelineOffsetSec: number;
   videoPath: string;
   jobDir: string;
   outputDir: string;
@@ -97,6 +140,7 @@ async function executePostTranscribeStages(params: {
     transcript,
     budget,
     durationMin,
+    timelineOffsetSec,
     videoPath,
     jobDir,
     outputDir,
@@ -136,6 +180,7 @@ async function executePostTranscribeStages(params: {
       clips: ms.clips,
       budget,
       durationMin,
+      timelineOffsetSec,
     });
   } finally {
     await renderLease.release();
@@ -205,13 +250,11 @@ export async function runTranscribeWorkerJob(
     const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
 
     try {
-      const durationSec = await getVideoDuration(videoPath);
-      if (!Number.isFinite(durationSec) || durationSec <= 0) {
-        throw new Error("Could not read video duration.");
-      }
-      const durationMin = durationSec / 60;
-
-      const budget = await getProcessingBudget(userId, durationMin);
+      const {
+        budget,
+        extractOpts,
+        fullDurationMin,
+      } = await getBudgetAndExtractOptsForJob({ jobId, userId, videoPath });
       if (!budget.allowed) {
         throw new Error(
           budget.blockedMessage ?? "No minutes remaining this month."
@@ -222,13 +265,7 @@ export async function runTranscribeWorkerJob(
       console.log(
         `[Job ${jobId}] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
       );
-      console.log(`[Job ${jobId}] Video duration: ${durationMin.toFixed(2)} min`);
-
-      const effectiveScanSec = budget.effectiveScanMinutes * 60;
-      const extractOpts =
-        effectiveScanSec + 0.01 < durationSec
-          ? { maxDurationSec: effectiveScanSec }
-          : undefined;
+      console.log(`[Job ${jobId}] Source duration: ${fullDurationMin.toFixed(2)} min`);
 
       const audioPath = path.join(jobDir, "audio.wav");
       const transcriptPath = path.join(jobDir, "transcript.json");
@@ -327,13 +364,11 @@ export async function runProcessJobFromMomentSelection(
     const transcriptPath = path.join(jobDir, "transcript.json");
 
     try {
-      const durationSec = await getVideoDuration(videoPath);
-      if (!Number.isFinite(durationSec) || durationSec <= 0) {
-        throw new Error("Could not read video duration.");
-      }
-      const durationMin = durationSec / 60;
-
-      const budget = await getProcessingBudget(userId, durationMin);
+      const {
+        budget,
+        fullDurationMin,
+        timelineOffsetSec,
+      } = await getBudgetAndExtractOptsForJob({ jobId, userId, videoPath });
       if (!budget.allowed) {
         throw new Error(
           budget.blockedMessage ?? "No minutes remaining this month."
@@ -344,7 +379,7 @@ export async function runProcessJobFromMomentSelection(
       console.log(
         `[Job ${jobId}] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
       );
-      console.log(`[Job ${jobId}] Video duration: ${durationMin.toFixed(2)} min`);
+      console.log(`[Job ${jobId}] Source duration: ${fullDurationMin.toFixed(2)} min`);
 
       postTranscribeGate = await fsLease.tryAcquire(jobId, "moment_selection");
       if (!postTranscribeGate) {
@@ -372,7 +407,8 @@ export async function runProcessJobFromMomentSelection(
         goal,
         transcript,
         budget,
-        durationMin,
+        durationMin: fullDurationMin,
+        timelineOffsetSec,
         videoPath,
         jobDir,
         outputDir,
@@ -460,13 +496,12 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
 
     try {
       logE2E(jobId, "main_worker_claimed", { pipeline: "unified" });
-      const durationSec = await getVideoDuration(videoPath);
-      if (!Number.isFinite(durationSec) || durationSec <= 0) {
-        throw new Error("Could not read video duration.");
-      }
-      const durationMin = durationSec / 60;
-
-      const budget = await getProcessingBudget(userId, durationMin);
+      const {
+        budget,
+        extractOpts,
+        fullDurationMin,
+        timelineOffsetSec,
+      } = await getBudgetAndExtractOptsForJob({ jobId, userId, videoPath });
       if (!budget.allowed) {
         throw new Error(
           budget.blockedMessage ?? "No minutes remaining this month."
@@ -477,13 +512,7 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
       console.log(
         `[Job ${jobId}] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
       );
-      console.log(`[Job ${jobId}] Video duration: ${durationMin.toFixed(2)} min`);
-
-      const effectiveScanSec = budget.effectiveScanMinutes * 60;
-      const extractOpts =
-        effectiveScanSec + 0.01 < durationSec
-          ? { maxDurationSec: effectiveScanSec }
-          : undefined;
+      console.log(`[Job ${jobId}] Source duration: ${fullDurationMin.toFixed(2)} min`);
 
       const audioPath = path.join(jobDir, "audio.wav");
       const transcriptPath = path.join(jobDir, "transcript.json");
@@ -519,7 +548,8 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
         goal,
         transcript: et.result.transcript,
         budget,
-        durationMin,
+        durationMin: fullDurationMin,
+        timelineOffsetSec,
         videoPath,
         jobDir,
         outputDir,

@@ -22,10 +22,22 @@ export async function runClipRenderStage(params: {
   preset: ReturnType<typeof getPreset>;
   clips: ReturnType<typeof findBestMoments>;
   budget: ProcessingBudget;
+  /** Minutes (for scanInfo); typically full source length. */
   durationMin: number;
+  /** Offsets transcript-relative clip times to absolute source timeline (long-video windows). */
+  timelineOffsetSec?: number;
 }): Promise<ClipRenderStageResult> {
-  const { jobId, videoPath, jobDir, outputDir, preset, clips, budget, durationMin } =
-    params;
+  const {
+    jobId,
+    videoPath,
+    jobDir,
+    outputDir,
+    preset,
+    clips,
+    budget,
+    durationMin,
+    timelineOffsetSec = 0,
+  } = params;
 
   if (clips.length === 0) {
     await persistPipelineStage(jobId, "clips_rendered");
@@ -64,12 +76,15 @@ export async function runClipRenderStage(params: {
     const outputSrt = path.join(outputDir, `clip_${clipNum}.srt`);
     await copyFile(srtPath, outputSrt);
 
+    const absStart = timelineOffsetSec + clip.startSec;
+    const absEnd = timelineOffsetSec + clip.endSec;
+
     {
       const tCut = performance.now();
       await cutClip(
         videoPath,
-        clip.startSec,
-        clip.endSec,
+        absStart,
+        absEnd,
         clipPath,
         sourceDimensions
       );
@@ -83,8 +98,8 @@ export async function runClipRenderStage(params: {
       srtUrl: `/api/files/outputs/${jobId}/clip_${clipNum}.srt`,
       hook: clip.hook,
       confidence: clip.confidence,
-      startSec: clip.startSec,
-      endSec: clip.endSec,
+      startSec: absStart,
+      endSec: absEnd,
     });
   }
   if (clips.length === 1) {

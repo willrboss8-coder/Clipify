@@ -58,6 +58,11 @@ export interface JobRecord {
   updatedAt: string;
   platform: string;
   goal: string;
+  /**
+   * Seconds on the source file to scan (set at upload-complete). Omitted for legacy jobs = full file.
+   */
+  scanStartSec?: number;
+  scanEndSec?: number;
   error?: string;
   /** Present when status === "completed" */
   result?: ProcessResponse;

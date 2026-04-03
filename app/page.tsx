@@ -12,6 +12,10 @@ import { useUser, UserButton, useAuth, useClerk } from "@clerk/nextjs";
 import { PRO_POSITIONING, POWER_POSITIONING } from "@/lib/plans";
 import type { ViralCaptionAccess } from "@/lib/viral-captions";
 import type { ClipResult, ProcessResponse } from "@/lib/types/clip-job";
+import {
+  MAX_PROCESSING_WINDOW_SEC,
+  type LongVideoSegment,
+} from "@/lib/scan-window";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -450,6 +454,10 @@ export default function HomePage() {
   const [viralLoadingIndex, setViralLoadingIndex] = useState<number | null>(null);
   /** Client-side duration from file metadata (for pre-check vs plan minutes) */
   const [videoDurationSec, setVideoDurationSec] = useState<number | null>(null);
+  /** Required when source is longer than {@link MAX_PROCESSING_WINDOW_SEC} (server scans one window). */
+  const [longVideoSegment, setLongVideoSegment] = useState<LongVideoSegment | null>(
+    null
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Incremented when the user taps "Upload Video" so preflight only runs after an explicit action. */
@@ -467,8 +475,10 @@ export default function HomePage() {
   useEffect(() => {
     if (!file) {
       setVideoDurationSec(null);
+      setLongVideoSegment(null);
       return;
     }
+    setLongVideoSegment(null);
     const url = URL.createObjectURL(file);
     const video = document.createElement("video");
     video.preload = "metadata";
@@ -496,7 +506,20 @@ export default function HomePage() {
 
   /** Background init + R2 PUT only (no upload-complete) so upload overlaps user choices. */
   useEffect(() => {
-    if (!file || !isSignedIn || !authLoaded || uploadTrigger === 0) {
+    const durationReady =
+      videoDurationSec != null && videoDurationSec > 0;
+    const isLong =
+      durationReady && videoDurationSec > MAX_PROCESSING_WINDOW_SEC;
+    const segmentOk = !isLong || longVideoSegment != null;
+    const uploadPrereqsMet = durationReady && segmentOk;
+
+    if (
+      !file ||
+      !isSignedIn ||
+      !authLoaded ||
+      uploadTrigger === 0 ||
+      !uploadPrereqsMet
+    ) {
       preflightRunIdRef.current += 1;
       preflightPutXhrRef.current?.abort();
       preflightPutXhrRef.current = null;
@@ -733,7 +756,17 @@ export default function HomePage() {
       setPreflightTerminalFailed(false);
       setUploadProgress(null);
     };
-  }, [file, platform, goal, isSignedIn, authLoaded, getToken, uploadTrigger]);
+  }, [
+    file,
+    platform,
+    goal,
+    isSignedIn,
+    authLoaded,
+    getToken,
+    uploadTrigger,
+    videoDurationSec,
+    longVideoSegment,
+  ]);
 
   /** After Stripe redirects back, Clerk session may still have old `publicMetadata` until reload */
   useEffect(() => {
@@ -1221,6 +1254,12 @@ export default function HomePage() {
     videoDurationSec != null && videoDurationSec > 0
       ? videoDurationSec / 60
       : null;
+  const durationReady =
+    videoDurationSec != null && videoDurationSec > 0;
+  const isLongVideo =
+    durationReady && videoDurationSec > MAX_PROCESSING_WINDOW_SEC;
+  const longVideoSegmentOk = !isLongVideo || longVideoSegment != null;
+  const uploadPrereqsMet = durationReady && longVideoSegmentOk;
   const showPartialScanWarning =
     usage != null &&
     usage.minutesRemaining > 0 &&
@@ -1259,6 +1298,12 @@ export default function HomePage() {
 
   const handleUploadVideoClick = useCallback(() => {
     if (!file || !authLoaded || !isSignedIn) return;
+    const durationReady =
+      videoDurationSec != null && videoDurationSec > 0;
+    const isLong =
+      durationReady && videoDurationSec > MAX_PROCESSING_WINDOW_SEC;
+    if (!durationReady) return;
+    if (isLong && !longVideoSegment) return;
     if (usage != null && usage.minutesRemaining <= 0) return;
     if (preflightTerminalFailed) {
       preflightRunIdRef.current += 1;
@@ -1272,7 +1317,15 @@ export default function HomePage() {
       setUploadProgress(null);
     }
     setUploadTrigger((n) => n + 1);
-  }, [file, authLoaded, isSignedIn, usage, preflightTerminalFailed]);
+  }, [
+    file,
+    authLoaded,
+    isSignedIn,
+    usage,
+    preflightTerminalFailed,
+    videoDurationSec,
+    longVideoSegment,
+  ]);
 
   /** Simulated backend steps. Use `startStepIndex = 1` after file upload so we don&apos;t show &quot;Uploading video&quot; again. */
   const simulateProgress = (startStepIndex = 0) => {
@@ -1337,6 +1390,18 @@ export default function HomePage() {
       );
       return;
     }
+    if (!durationReady) {
+      setError(
+        "Still reading video length — wait a moment, or try another file."
+      );
+      return;
+    }
+    if (isLongVideo && !longVideoSegment) {
+      setError(
+        "Choose Beginning, Middle, or End to process a 60-minute section of your video."
+      );
+      return;
+    }
     if (generationInFlightRef.current) return;
 
     setError(null);
@@ -1387,6 +1452,11 @@ export default function HomePage() {
           setPreflightReadyHint(false);
           setPreflightTerminalFailed(false);
         }
+
+        const uploadCompletePayload = (jid: string) =>
+          isLongVideo && longVideoSegment
+            ? { jobId: jid, longVideoSegment }
+            : { jobId: jid };
 
         const finalizeUploadResponse = async (
           raw: string,
@@ -1467,6 +1537,16 @@ export default function HomePage() {
               redirectToSignIn({ redirectUrl: window.location.href });
               return false;
             }
+            if (
+              status === 400 &&
+              parsed.longVideoSegmentRequired === true
+            ) {
+              setError(
+                errText ||
+                  "Video is longer than 60 minutes. Choose Beginning, Middle, or End to process one 60-minute section."
+              );
+              return false;
+            }
             throw new Error(
               errText || messageForFailedProcessResponse(fauxRes, raw)
             );
@@ -1515,7 +1595,7 @@ export default function HomePage() {
               method: "POST",
               credentials: "include",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ jobId }),
+              body: JSON.stringify(uploadCompletePayload(jobId)),
             });
 
           let completeRes = await postUploadComplete();
@@ -1550,6 +1630,9 @@ export default function HomePage() {
             const form = new FormData();
             form.append("file", file);
             form.append("jobId", jobId);
+            if (isLongVideo && longVideoSegment) {
+              form.append("longVideoSegment", longVideoSegment);
+            }
             return form;
           };
 
@@ -1666,6 +1749,9 @@ export default function HomePage() {
           const form = new FormData();
           form.append("file", file);
           form.append("jobId", jobId);
+          if (isLongVideo && longVideoSegment) {
+            form.append("longVideoSegment", longVideoSegment);
+          }
           return form;
         };
 
@@ -1803,7 +1889,7 @@ export default function HomePage() {
               method: "POST",
               credentials: "include",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ jobId }),
+              body: JSON.stringify(uploadCompletePayload(jobId)),
             });
 
           let completeRes = await postUploadComplete();
@@ -1944,6 +2030,7 @@ export default function HomePage() {
     if (usage != null && usage.minutesRemaining <= 0) return;
     if (preflightTerminalFailed) return;
     if (error) return;
+    if (!uploadPrereqsMet) return;
     if (generationInFlightRef.current || isCreatingJob) return;
 
     void handleGenerateRef.current();
@@ -1958,6 +2045,7 @@ export default function HomePage() {
     preflightTerminalFailed,
     error,
     isCreatingJob,
+    uploadPrereqsMet,
   ]);
 
   const isProcessing =
@@ -1983,7 +2071,8 @@ export default function HomePage() {
     (usage != null && usage.minutesRemaining <= 0) ||
     mustWaitForPreflightGate ||
     (file && !isSignedIn) ||
-    (file && !authLoaded);
+    (file && !authLoaded) ||
+    (file && !uploadPrereqsMet);
 
   /** Brief idle state after preflight before auto-start runs — keep CTA muted (no misleading primary). */
   const autoClipStartPending =
@@ -2038,6 +2127,10 @@ export default function HomePage() {
     generateButtonLabel = "Sign in to generate";
   } else if (usage != null && usage.minutesRemaining <= 0) {
     generateButtonLabel = "No minutes remaining";
+  } else if (file && !durationReady) {
+    generateButtonLabel = "Reading video…";
+  } else if (isLongVideo && !longVideoSegment) {
+    generateButtonLabel = "Choose a 60-minute section";
   } else if (uploadPhaseButtonLabel) {
     generateButtonLabel = "Uploading video...";
   } else if (isProcessing) {
@@ -2684,6 +2777,40 @@ export default function HomePage() {
                         {plan === "free" ? "Upgrade to Pro" : "Upgrade to Power"}
                       </button>
                     )}
+                  </div>
+                )}
+
+                {file && durationReady && isLongVideo && (
+                  <div className="bg-sky-900/20 border border-sky-700/50 rounded-xl p-4 text-sm text-sky-100/90 leading-relaxed">
+                    <p className="font-medium text-sky-100 mb-2">
+                      This video is longer than the recommended 60-minute processing limit.
+                    </p>
+                    <p className="mb-3 text-sky-100/85">
+                      We&apos;ll scan one 60-minute section for clips so processing stays fast and
+                      reliable. Choose which part of the video to use:
+                    </p>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      {(
+                        [
+                          ["beginning", "Beginning"],
+                          ["middle", "Middle"],
+                          ["end", "End"],
+                        ] as const
+                      ).map(([seg, label]) => (
+                        <button
+                          key={seg}
+                          type="button"
+                          onClick={() => setLongVideoSegment(seg)}
+                          className={`flex-1 py-2.5 px-3 rounded-lg text-sm font-medium transition-colors border ${
+                            longVideoSegment === seg
+                              ? "bg-sky-600/50 border-sky-400 text-white"
+                              : "bg-gray-900/80 border-gray-600 text-gray-200 hover:border-sky-500/50"
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
 

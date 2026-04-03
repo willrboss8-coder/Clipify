@@ -4,6 +4,11 @@ import { getProcessingBudget } from "@/lib/usage";
 import { readJobRecord, writeJobRecord, patchJobRecord } from "@/lib/jobStore";
 import { logE2E } from "@/lib/e2e-timing";
 import type { JobRecord } from "@/lib/types/clip-job";
+import {
+  computeScanWindowSec,
+  MAX_PROCESSING_WINDOW_SEC,
+  type LongVideoSegment,
+} from "@/lib/scan-window";
 
 async function failJob(rec: JobRecord, error: string): Promise<void> {
   await writeJobRecord(
@@ -20,13 +25,15 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   userId: string;
   videoPath: string;
   rec: JobRecord;
+  /** When the source is longer than 60 minutes, which 60-minute window to process. */
+  longVideoSegment?: LongVideoSegment;
   /** Optional: R2 upload-complete instrumentation only; does not change behavior. */
   onTimingMs?: (
     phase: "getVideoDuration" | "getProcessingBudget",
     ms: number
   ) => void;
 }): Promise<NextResponse | null> {
-  const { jobId, userId, videoPath, rec, onTimingMs } = params;
+  const { jobId, userId, videoPath, rec, longVideoSegment, onTimingMs } = params;
 
   let t = performance.now();
   const durationSec = await getVideoDuration(videoPath);
@@ -43,14 +50,39 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   }
   const durationMin = durationSec / 60;
 
+  const window =
+    durationSec <= MAX_PROCESSING_WINDOW_SEC
+      ? computeScanWindowSec(durationSec, undefined)!
+      : computeScanWindowSec(durationSec, longVideoSegment);
+  if (window == null) {
+    return NextResponse.json(
+      {
+        error:
+          "Video is longer than 60 minutes. Choose Beginning, Middle, or End to process one 60-minute section.",
+        longVideoSegmentRequired: true,
+      },
+      {
+        status: 400,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      }
+    );
+  }
+  const scanStartSec = window!.startSec;
+  const scanEndSec = window!.endSec;
+  const windowLenSec = scanEndSec - scanStartSec;
+  const windowMin = windowLenSec / 60;
+
   t = performance.now();
-  const budget = await getProcessingBudget(userId, durationMin);
+  const budget = await getProcessingBudget(userId, windowMin);
   onTimingMs?.("getProcessingBudget", performance.now() - t);
   console.log(`[Usage] User plan: ${budget.usage.plan}`);
   console.log(
     `[Usage] Remaining minutes before job: ${budget.usage.minutesRemaining.toFixed(2)}`
   );
-  console.log(`[Usage] Video duration: ${durationMin.toFixed(2)} min`);
+  console.log(`[Usage] Source duration: ${durationMin.toFixed(2)} min`);
+  console.log(
+    `[Usage] Scan window: ${scanStartSec.toFixed(1)}s–${scanEndSec.toFixed(1)}s (${windowMin.toFixed(2)} min)`
+  );
   console.log(
     `[Usage] Scan budget: ${budget.effectiveScanMinutes.toFixed(2)} min (capped=${budget.capped})`
   );
@@ -85,6 +117,8 @@ export async function finalizeJobAfterLocalVideoWritten(params: {
   await writeJobRecord(
     patchJobRecord(latest, {
       status: "queued",
+      scanStartSec,
+      scanEndSec,
     })
   );
   logE2E(jobId, "job_enqueued");

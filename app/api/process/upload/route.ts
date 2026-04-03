@@ -10,6 +10,7 @@ import {
   finalizeJobAfterLocalVideoWritten,
   successQueuedJsonResponse,
 } from "@/lib/process-upload-finalize";
+import type { LongVideoSegment } from "@/lib/scan-window";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,6 +53,16 @@ export async function POST(req: NextRequest) {
     const jobId =
       typeof jobIdRaw === "string" ? jobIdRaw.trim() : "";
 
+    const segRaw = formData.get("longVideoSegment");
+    let longVideoSegment: LongVideoSegment | undefined;
+    if (
+      segRaw === "beginning" ||
+      segRaw === "middle" ||
+      segRaw === "end"
+    ) {
+      longVideoSegment = segRaw;
+    }
+
     if (!file) {
       return jsonError("No file uploaded", 400);
     }
@@ -84,6 +95,7 @@ export async function POST(req: NextRequest) {
       userId,
       videoPath,
       rec,
+      longVideoSegment,
     });
     if (finalize) return finalize;
 

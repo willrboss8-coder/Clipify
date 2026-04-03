@@ -62,11 +62,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    let body: { jobId?: string };
+    let body: { jobId?: string; longVideoSegment?: string };
     try {
-      body = (await req.json()) as { jobId?: string };
+      body = (await req.json()) as { jobId?: string; longVideoSegment?: string };
     } catch {
       return jsonError("Invalid JSON body", 400);
+    }
+
+    let longVideoSegment: "beginning" | "middle" | "end" | undefined;
+    const rawSeg = body.longVideoSegment;
+    if (
+      rawSeg === "beginning" ||
+      rawSeg === "middle" ||
+      rawSeg === "end"
+    ) {
+      longVideoSegment = rawSeg;
     }
 
     const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
@@ -142,6 +152,7 @@ export async function POST(req: NextRequest) {
         userId,
         videoPath,
         rec,
+        longVideoSegment,
         onTimingMs: (phase, ms) => {
           if (phase === "getVideoDuration") durationMs = ms;
           if (phase === "getProcessingBudget") budgetMs = ms;

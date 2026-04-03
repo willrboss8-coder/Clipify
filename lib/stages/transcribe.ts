@@ -42,7 +42,7 @@ export async function runExtractAndTranscribeStage(params: {
   videoPath: string;
   audioPath: string;
   transcriptPath: string;
-  extractOpts?: { maxDurationSec: number };
+  extractOpts?: { startSec?: number; maxDurationSec?: number };
   claimedAtMs: number;
 }): Promise<{
   result: ExtractTranscribeStageResult;

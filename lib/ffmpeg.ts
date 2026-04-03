@@ -32,9 +32,14 @@ const ENCODE_ARGS = [
 export async function extractAudio(
   videoPath: string,
   outputPath: string,
-  options?: { maxDurationSec?: number }
+  options?: { startSec?: number; maxDurationSec?: number }
 ): Promise<void> {
-  const args = ["-y", "-i", videoPath];
+  const args = ["-y"];
+  const start = options?.startSec;
+  if (start != null && start > 0 && Number.isFinite(start)) {
+    args.push("-ss", start.toFixed(3));
+  }
+  args.push("-i", videoPath);
   const cap = options?.maxDurationSec;
   if (cap != null && cap > 0 && Number.isFinite(cap)) {
     args.push("-t", cap.toFixed(3));
