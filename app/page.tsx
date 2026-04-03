@@ -9,7 +9,11 @@ import {
   type MutableRefObject,
 } from "react";
 import { useUser, UserButton, useAuth, useClerk } from "@clerk/nextjs";
-import { PRO_POSITIONING, POWER_POSITIONING } from "@/lib/plans";
+import {
+  PLAN_LIMITS,
+  PRO_POSITIONING,
+  POWER_POSITIONING,
+} from "@/lib/plans";
 import type { ViralCaptionAccess } from "@/lib/viral-captions";
 import type { ClipResult, ProcessResponse } from "@/lib/types/clip-job";
 import {
@@ -465,6 +469,10 @@ export default function HomePage() {
   /** Set after client-side ffmpeg trim for long videos (smaller upload). */
   const [clientTrimmedFile, setClientTrimmedFile] = useState<File | null>(null);
   const [clientTrimBusy, setClientTrimBusy] = useState(false);
+  /** FFmpeg-reported 0–1 while trimming; null before first progress tick. */
+  const [clientTrimProgress, setClientTrimProgress] = useState<number | null>(
+    null
+  );
   const inputRef = useRef<HTMLInputElement>(null);
   const successTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Incremented when the user taps "Upload Video" so preflight only runs after an explicit action. */
@@ -513,6 +521,7 @@ export default function HomePage() {
 
   useEffect(() => {
     setClientTrimmedFile(null);
+    setClientTrimProgress(null);
   }, [file, longVideoSegment]);
 
   const fileForUpload =
@@ -1310,6 +1319,7 @@ export default function HomePage() {
     setUploadTrigger(0);
     setFile(null);
     setClientTrimmedFile(null);
+    setClientTrimProgress(null);
     setError(null);
     if (inputRef.current) inputRef.current.value = "";
   }, []);
@@ -1341,12 +1351,18 @@ export default function HomePage() {
       videoDurationSec != null &&
       shouldAttemptClientTrim(file, isLong)
     ) {
+      setClientTrimProgress(null);
       setClientTrimBusy(true);
       try {
         const blob = await trimLocalVideoToSegment({
           file,
           segment: longVideoSegment,
           originalDurationSec: videoDurationSec,
+          onProgress: (ratio) => {
+            setClientTrimProgress(
+              Math.min(1, Math.max(0, Number.isFinite(ratio) ? ratio : 0))
+            );
+          },
         });
         setClientTrimmedFile(
           new File([blob], file.name, { type: "video/mp4" })
@@ -1356,6 +1372,7 @@ export default function HomePage() {
         setClientTrimmedFile(null);
       } finally {
         setClientTrimBusy(false);
+        setClientTrimProgress(null);
       }
     } else {
       setClientTrimmedFile(null);
@@ -2193,7 +2210,10 @@ export default function HomePage() {
   } else if (isLongVideo && !longVideoSegment) {
     generateButtonLabel = "Choose a 60-minute section";
   } else if (clientTrimBusy) {
-    generateButtonLabel = "Preparing segment…";
+    generateButtonLabel =
+      clientTrimProgress != null && clientTrimProgress > 0.02
+        ? "Trimming 60-minute section…"
+        : "Preparing selected section…";
   } else if (uploadPhaseButtonLabel) {
     generateButtonLabel = "Uploading video...";
   } else if (isProcessing) {
@@ -2911,26 +2931,62 @@ export default function HomePage() {
                       return;
                     }
                     if (!preflightReadyHint || preflightTerminalFailed) {
-                      handleUploadVideoClick();
+                      void handleUploadVideoClick();
                       return;
                     }
                     void handleGenerate();
                   }}
                   disabled={generateDisabled}
+                  aria-busy={clientTrimBusy}
                   className={`w-full py-4 rounded-xl font-semibold text-lg transition-all border ${
-                    showPrimaryCta
+                    showPrimaryCta || clientTrimBusy
                       ? "bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white shadow-lg shadow-purple-500/20 border-transparent"
                       : "bg-gray-800/90 text-gray-500 border-gray-700/80 shadow-none"
                   } ${
                     generateDisabled
-                      ? "cursor-not-allowed opacity-50"
+                      ? clientTrimBusy
+                        ? "cursor-wait opacity-100"
+                        : "cursor-not-allowed opacity-50"
                       : !showPrimaryCta
                         ? "cursor-pointer text-gray-300 border-gray-600/80 hover:bg-gray-800/95 opacity-100"
                         : "cursor-pointer opacity-100"
                   }`}
                 >
-                  {generateButtonLabel}
+                  {clientTrimBusy ? (
+                    <span className="inline-flex items-center justify-center gap-2.5">
+                      <span
+                        className="inline-block h-5 w-5 shrink-0 rounded-full border-2 border-white/35 border-t-white animate-spin"
+                        aria-hidden
+                      />
+                      <span>{generateButtonLabel}</span>
+                    </span>
+                  ) : (
+                    generateButtonLabel
+                  )}
                 </button>
+                {clientTrimBusy && !result && (
+                  <div className="mt-3 space-y-2.5 text-center px-1">
+                    <p className="text-xs text-gray-500 max-w-md mx-auto leading-relaxed">
+                      Trimming to your selected 60-minute section in the browser
+                      before upload. Large files may take a minute.
+                    </p>
+                    {clientTrimProgress != null && clientTrimProgress > 0.02 && (
+                      <div className="w-full max-w-xs mx-auto space-y-1">
+                        <p className="text-[11px] text-gray-500">
+                          About {Math.round(clientTrimProgress * 100)}% complete
+                        </p>
+                        <div className="h-1 rounded-full bg-gray-800 overflow-hidden">
+                          <div
+                            className="h-full bg-purple-400/80 transition-[width] duration-200 ease-out"
+                            style={{
+                              width: `${Math.min(100, Math.round(clientTrimProgress * 100))}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
                 {preflightUploadActive && !result && (
                   <div className="mt-2 flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                     <p className="text-xs text-gray-500 text-center sm:text-left sm:flex-1">
@@ -3092,7 +3148,7 @@ export default function HomePage() {
                     Try Clipify risk-free
                   </p>
                   <div className="text-2xl font-bold text-white mb-5">
-                    30{" "}
+                    {PLAN_LIMITS.free.minutesPerMonth.toLocaleString("en-US")}{" "}
                     <span className="text-sm font-normal text-gray-500">
                       min / month
                     </span>
@@ -3141,7 +3197,7 @@ export default function HomePage() {
                     Built for active podcasters and creators
                   </p>
                   <div className="text-2xl font-bold text-white mb-5">
-                    1,000{" "}
+                    {PLAN_LIMITS.pro.minutesPerMonth.toLocaleString("en-US")}{" "}
                     <span className="text-sm font-normal text-gray-500">
                       min / month
                     </span>
@@ -3149,7 +3205,8 @@ export default function HomePage() {
                   <ul className="space-y-2.5 text-sm text-gray-200 flex-1">
                     <li className="flex items-start gap-2">
                       <span className="text-purple-400 mt-0.5">✓</span>
-                      1,000 minutes/month
+                      {PLAN_LIMITS.pro.minutesPerMonth.toLocaleString("en-US")}{" "}
+                      minutes/month
                     </li>
                     <li className="flex items-start gap-2">
                       <span className="text-purple-400 mt-0.5">✓</span>
@@ -3212,7 +3269,7 @@ export default function HomePage() {
                     Built for high-volume workflows
                   </p>
                   <div className="text-2xl font-bold text-white mb-5">
-                    3,000{" "}
+                    {PLAN_LIMITS.power.minutesPerMonth.toLocaleString("en-US")}{" "}
                     <span className="text-sm font-normal text-gray-500">
                       min / month
                     </span>
@@ -3222,7 +3279,8 @@ export default function HomePage() {
                       <span className="text-amber-300/90 mt-0.5 drop-shadow-[0_0_6px_rgba(251,191,36,0.25)]">
                         ✓
                       </span>
-                      3,000 minutes/month
+                      {PLAN_LIMITS.power.minutesPerMonth.toLocaleString("en-US")}{" "}
+                      minutes/month
                     </li>
                     <li className="flex items-start gap-2">
                       <span className="text-amber-300/90 mt-0.5 drop-shadow-[0_0_6px_rgba(251,191,36,0.25)]">

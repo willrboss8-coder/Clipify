@@ -7,8 +7,8 @@ export interface PlanConfig {
 
 export const PLAN_LIMITS: Record<Plan, PlanConfig> = {
   free: { minutesPerMonth: 30, label: "Free" },
-  pro: { minutesPerMonth: 1000, label: "Pro" },
-  power: { minutesPerMonth: 3000, label: "Power" },
+  pro: { minutesPerMonth: 500, label: "Pro" },
+  power: { minutesPerMonth: 1500, label: "Power" },
 };
 
 export function getPlanLimit(plan: Plan): number {
