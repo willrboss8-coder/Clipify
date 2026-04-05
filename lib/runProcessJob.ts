@@ -20,6 +20,7 @@ import {
 import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
 import { logE2E } from "@/lib/e2e-timing";
 import { getJobScanBounds } from "@/lib/scan-window";
+import { localFullSourcePath } from "@/lib/video-source-layout";
 
 function logPipelineTiming(
   jobId: string,
@@ -271,7 +272,7 @@ export async function runTranscribeWorkerJob(
     const scriptPath = path.resolve(process.cwd(), "scripts", "transcribe.py");
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
-    const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
+    const videoPath = localFullSourcePath(uploadsDir, jobId);
 
     try {
       const {
@@ -384,7 +385,7 @@ export async function runProcessJobFromMomentSelection(
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
     const outputDir = path.join(ROOT, "outputs", jobId);
-    const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
+    const videoPath = localFullSourcePath(uploadsDir, jobId);
     const transcriptPath = path.join(jobDir, "transcript.json");
 
     try {
@@ -516,7 +517,7 @@ export async function runProcessJob(params: RunProcessJobParams): Promise<void> 
     const uploadsDir = path.join(ROOT, "uploads");
     const jobDir = path.join(ROOT, "jobs", jobId);
     const outputDir = path.join(ROOT, "outputs", jobId);
-    const videoPath = path.join(uploadsDir, `${jobId}.mp4`);
+    const videoPath = localFullSourcePath(uploadsDir, jobId);
 
     try {
       logE2E(jobId, "main_worker_claimed", { pipeline: "unified" });

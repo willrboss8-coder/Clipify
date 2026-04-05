@@ -5,8 +5,10 @@ Upload a long video and automatically generate short vertical clips optimized fo
 ## Prerequisites
 
 ```bash
-brew install ffmpeg python
+brew install ffmpeg python yt-dlp
 pip install faster-whisper
+# Or install Python deps (includes yt-dlp for YouTube links):
+pip install -r requirements.txt
 ```
 
 ## Setup

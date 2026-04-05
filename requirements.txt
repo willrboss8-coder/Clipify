@@ -1,2 +1,4 @@
 # Used by scripts/transcribe.py (faster-whisper). Pin for reproducible builds.
 faster-whisper>=1.0.3,<2
+# YouTube URL ingest (server-side download; no Google API key).
+yt-dlp>=2024.1.0
