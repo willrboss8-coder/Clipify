@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { logClerkAuthDebug } from "@/lib/clerk-auth-debug";
 import { hasTranscriptionScript } from "@/lib/persistent-transcribe";
-import { fetchYoutubeMetadata, assertYtDlpAvailable } from "@/lib/youtube-download";
+import {
+  fetchYoutubeMetadata,
+  assertYtDlpAvailable,
+} from "@/lib/youtube-download";
+import { YoutubeDlpUserError } from "@/lib/youtube-dlp-errors";
 import { isAllowedYoutubeUrl, normalizeYoutubeUrl } from "@/lib/youtube-url";
 
 export const runtime = "nodejs";
@@ -71,6 +75,16 @@ export async function POST(req: NextRequest) {
         }
       );
     } catch (e: unknown) {
+      if (e instanceof YoutubeDlpUserError) {
+        console.error("[youtube-metadata] auth/bot wall (details in yt-dlp logs above)");
+        return NextResponse.json(
+          { error: e.message, code: e.code },
+          {
+            status: 403,
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+          }
+        );
+      }
       const msg =
         e instanceof Error ? e.message : "Could not read video metadata.";
       return jsonError(msg.slice(0, 2000), 400);

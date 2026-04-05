@@ -20,6 +20,12 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
+### YouTube links (optional `yt-dlp` cookies)
+
+Paste links use **yt-dlp** on the server only (no YouTube Data API). YouTube sometimes returns bot-check / sign-in walls; without extra setup, those links may fail and the app shows a short message instead of raw tool output.
+
+Optionally set **`YT_DLP_COOKIES_FILE`** to an absolute path of a **Netscape-format cookies file** (e.g. exported for use with `yt-dlp`). That file is read **only on the server** by `yt-dlp` for metadata and download—not by the browser and not by user accounts in the app. If the variable is unset, behavior matches the previous release (no cookies). If the path is set but the file is missing, cookies are skipped and a warning is logged.
+
 ### Premium viral captions (optional word-level timing)
 
 By default, viral caption **timing** uses the existing local **SRT** from the job. For **better sync**, set:

@@ -16,6 +16,7 @@ import {
   downloadYoutubeToFile,
   fetchYoutubeMetadata,
 } from "@/lib/youtube-download";
+import { YoutubeDlpUserError } from "@/lib/youtube-dlp-errors";
 import { isAllowedYoutubeUrl, normalizeYoutubeUrl } from "@/lib/youtube-url";
 import { MAX_PROCESSING_WINDOW_SEC } from "@/lib/scan-window";
 
@@ -115,6 +116,16 @@ export async function POST(req: NextRequest) {
       const meta = await fetchYoutubeMetadata(youtubeUrl);
       durationSec = meta.durationSec;
     } catch (e: unknown) {
+      if (e instanceof YoutubeDlpUserError) {
+        console.error("[youtube-ingest] metadata auth/bot wall (see yt-dlp stderr in logs)");
+        return NextResponse.json(
+          { error: e.message, code: e.code },
+          {
+            status: 403,
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+          }
+        );
+      }
       const msg =
         e instanceof Error ? e.message : "Could not read video metadata.";
       return jsonError(msg.slice(0, 2000), 400);
@@ -144,7 +155,12 @@ export async function POST(req: NextRequest) {
     try {
       await downloadYoutubeToFile(youtubeUrl, videoPath);
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Download failed";
+      const authErr = e instanceof YoutubeDlpUserError ? e : null;
+      const msg = authErr
+        ? authErr.message
+        : e instanceof Error
+          ? e.message
+          : "Download failed";
       console.error("[youtube-ingest] download error:", e);
       try {
         await unlink(videoPath);
@@ -158,6 +174,15 @@ export async function POST(req: NextRequest) {
             status: "failed",
             error: msg.slice(0, 2000),
           })
+        );
+      }
+      if (authErr) {
+        return NextResponse.json(
+          { error: authErr.message, code: authErr.code },
+          {
+            status: 403,
+            headers: { "Content-Type": "application/json; charset=utf-8" },
+          }
         );
       }
       return jsonError(

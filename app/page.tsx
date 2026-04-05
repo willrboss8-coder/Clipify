@@ -28,6 +28,10 @@ import {
   uploadFileToR2WithProgress,
   type UploadProgressState,
 } from "@/lib/r2-client-upload";
+import {
+  YOUTUBE_AUTH_FRIENDLY_MESSAGE,
+  YOUTUBE_AUTH_REQUIRED_CODE,
+} from "@/lib/youtube-dlp-errors";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -1646,6 +1650,10 @@ export default function HomePage() {
             if (status === 401 || /unauthorized/i.test(errText)) {
               setError(SESSION_EXPIRED_COPY);
               redirectToSignIn({ redirectUrl: window.location.href });
+              return false;
+            }
+            if (parsed.code === YOUTUBE_AUTH_REQUIRED_CODE) {
+              setError(errText || YOUTUBE_AUTH_FRIENDLY_MESSAGE);
               return false;
             }
             if (

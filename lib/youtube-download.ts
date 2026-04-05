@@ -1,4 +1,10 @@
+import { existsSync } from "fs";
 import { spawn } from "child_process";
+import {
+  isYoutubeDlpAuthLikeFailure,
+  YoutubeDlpUserError,
+  YOUTUBE_AUTH_FRIENDLY_MESSAGE,
+} from "@/lib/youtube-dlp-errors";
 
 function ytDlpExecutable(): string {
   const fromEnv = process.env.YT_DLP_PATH?.trim();
@@ -10,6 +16,22 @@ export interface YtDlpResult {
   code: number;
   stdout: string;
   stderr: string;
+}
+
+/**
+ * Optional Netscape cookies file for yt-dlp (`YT_DLP_COOKIES_FILE`).
+ * If the path is set but missing, logs a warning and omits cookies (same as unset).
+ */
+export function ytDlpCookieArgs(): string[] {
+  const p = process.env.YT_DLP_COOKIES_FILE?.trim();
+  if (!p) return [];
+  if (!existsSync(p)) {
+    console.warn(
+      `[yt-dlp] YT_DLP_COOKIES_FILE is set but file not found (skipping): ${p}`
+    );
+    return [];
+  }
+  return ["--cookies", p];
 }
 
 /**
@@ -49,6 +71,7 @@ export async function fetchYoutubeMetadata(
   url: string
 ): Promise<YoutubeMetadataResult> {
   const args = [
+    ...ytDlpCookieArgs(),
     "--no-playlist",
     "--skip-download",
     "--dump-json",
@@ -57,8 +80,17 @@ export async function fetchYoutubeMetadata(
   ];
   const { code, stdout, stderr } = await runYtDlp(args);
   if (code !== 0) {
-    const msg = stderr.trim() || stdout.trim() || "yt-dlp metadata failed";
-    throw new Error(msg.slice(-2000));
+    const combined = `${stderr}\n${stdout}`;
+    console.error(
+      "[yt-dlp] metadata failed (raw stderr tail):\n",
+      stderr.slice(-8000)
+    );
+    if (isYoutubeDlpAuthLikeFailure(combined)) {
+      throw new YoutubeDlpUserError(YOUTUBE_AUTH_FRIENDLY_MESSAGE);
+    }
+    throw new Error(
+      "Could not read video metadata. The link may be unavailable or unsupported."
+    );
   }
   let parsed: { duration?: number; title?: string };
   try {
@@ -103,6 +135,7 @@ export async function downloadYoutubeToFile(
   destPath: string
 ): Promise<void> {
   const args = [
+    ...ytDlpCookieArgs(),
     "--no-playlist",
     "--newline",
     "--no-warnings",
@@ -114,9 +147,18 @@ export async function downloadYoutubeToFile(
     destPath,
     url,
   ];
-  const { code, stderr } = await runYtDlp(args);
+  const { code, stdout, stderr } = await runYtDlp(args);
   if (code !== 0) {
-    const msg = stderr.trim() || "yt-dlp download failed";
-    throw new Error(msg.slice(-2000));
+    const combined = `${stderr}\n${stdout}`;
+    console.error(
+      "[yt-dlp] download failed (raw stderr tail):\n",
+      stderr.slice(-8000)
+    );
+    if (isYoutubeDlpAuthLikeFailure(combined)) {
+      throw new YoutubeDlpUserError(YOUTUBE_AUTH_FRIENDLY_MESSAGE);
+    }
+    throw new Error(
+      "Could not download this video. It may be private, region-blocked, or temporarily unavailable."
+    );
   }
 }
