@@ -5,9 +5,9 @@ Upload a long video and automatically generate short vertical clips optimized fo
 ## Prerequisites
 
 ```bash
-brew install ffmpeg python yt-dlp
+brew install ffmpeg python
 pip install faster-whisper
-# Or install Python deps (includes yt-dlp for YouTube links):
+# Or install Python deps:
 pip install -r requirements.txt
 ```
 
@@ -19,14 +19,6 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
-
-### YouTube links (optional `yt-dlp` cookies)
-
-Paste links use **yt-dlp** on the server only (no YouTube Data API). YouTube sometimes returns bot-check / sign-in walls; without extra setup, those links may fail and the app shows a short message instead of raw tool output.
-
-Optionally set **`YT_DLP_COOKIES_FILE`** to an absolute path of a **Netscape-format cookies file** (e.g. exported for use with `yt-dlp`). That file is read **only on the server** by `yt-dlp` for metadata and download—not by the browser and not by user accounts in the app. If the variable is unset, behavior matches the previous release (no cookies). If the path is set but the file is missing, cookies are skipped and a warning is logged.
-
-Metadata and download **retry** with several YouTube `player_client` chains (datacenter IPs often fail on the default web client). When cookies are present, `tv_downgraded,web_safari` is tried first. To force one strategy, set **`YT_DLP_YOUTUBE_EXTRACTOR_ARGS`** to a full string such as `youtube:player_client=tv_downgraded,web_safari` (or omit the `youtube:` prefix; it will be added). Keep **`yt-dlp` current** (`pip install -U yt-dlp` or redeploy after bumping `requirements.txt`).
 
 ### Premium viral captions (optional word-level timing)
 

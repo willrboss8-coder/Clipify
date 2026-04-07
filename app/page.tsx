@@ -28,10 +28,6 @@ import {
   uploadFileToR2WithProgress,
   type UploadProgressState,
 } from "@/lib/r2-client-upload";
-import {
-  YOUTUBE_AUTH_FRIENDLY_MESSAGE,
-  YOUTUBE_AUTH_REQUIRED_CODE,
-} from "@/lib/youtube-dlp-errors";
 
 type Platform = "tiktok" | "reels" | "shorts";
 type Goal = "growth" | "monetize";
@@ -417,70 +413,6 @@ export default function HomePage() {
   /** Incremented when the user taps "Upload Video" so preflight only runs after an explicit action. */
   const [uploadTrigger, setUploadTrigger] = useState(0);
 
-  type VideoSourceMode = "file" | "youtube";
-  const [videoSourceMode, setVideoSourceMode] = useState<VideoSourceMode>("file");
-  const [youtubeUrl, setYoutubeUrl] = useState("");
-  const [youtubeDurationSec, setYoutubeDurationSec] = useState<number | null>(
-    null
-  );
-  const [youtubeMetaLoading, setYoutubeMetaLoading] = useState(false);
-  const [youtubeMetaError, setYoutubeMetaError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (videoSourceMode !== "youtube") return;
-    const url = youtubeUrl.trim();
-    if (!url) {
-      setYoutubeDurationSec(null);
-      setYoutubeMetaError(null);
-      setYoutubeMetaLoading(false);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        setYoutubeMetaLoading(true);
-        setYoutubeMetaError(null);
-        try {
-          const r = await fetch("/api/process/youtube-metadata", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ youtubeUrl: url }),
-          });
-          const raw = await r.text();
-          if (!r.ok) {
-            let errMsg = "Could not read video info";
-            try {
-              const j = JSON.parse(raw) as { error?: string };
-              if (typeof j.error === "string" && j.error) errMsg = j.error;
-            } catch {
-              /* use default */
-            }
-            setYoutubeMetaError(errMsg);
-            setYoutubeDurationSec(null);
-            return;
-          }
-          const data = JSON.parse(raw) as { durationSec?: number };
-          if (
-            typeof data.durationSec === "number" &&
-            Number.isFinite(data.durationSec) &&
-            data.durationSec > 0
-          ) {
-            setYoutubeDurationSec(data.durationSec);
-          } else {
-            setYoutubeMetaError("Duration unavailable for this link.");
-            setYoutubeDurationSec(null);
-          }
-        } catch {
-          setYoutubeMetaError("Network error while loading video info.");
-          setYoutubeDurationSec(null);
-        } finally {
-          setYoutubeMetaLoading(false);
-        }
-      })();
-    }, 600);
-    return () => window.clearTimeout(timer);
-  }, [videoSourceMode, youtubeUrl]);
-
   useEffect(() => {
     fetch("/api/usage", { credentials: "include" })
       .then((r) => r.json())
@@ -540,7 +472,6 @@ export default function HomePage() {
     const uploadPrereqsMetPref = durationReadyPref && segmentOk;
 
     if (
-      videoSourceMode !== "file" ||
       !file ||
       !fileForUpload ||
       !isSignedIn ||
@@ -799,7 +730,6 @@ export default function HomePage() {
   }, [
     file,
     fileForUpload,
-    videoSourceMode,
     platform,
     goal,
     isSignedIn,
@@ -1293,18 +1223,13 @@ export default function HomePage() {
 
   const rec = getRecommendation(platform, goal);
 
-  const effectiveDurationSec =
-    videoSourceMode === "file" ? videoDurationSec : youtubeDurationSec;
+  const effectiveDurationSec = videoDurationSec;
   const effectiveDurationMin =
     effectiveDurationSec != null && effectiveDurationSec > 0
       ? effectiveDurationSec / 60
       : null;
   const durationReady =
-    videoSourceMode === "file"
-      ? videoDurationSec != null && videoDurationSec > 0
-      : youtubeDurationSec != null &&
-        youtubeDurationSec > 0 &&
-        !youtubeMetaLoading;
+    videoDurationSec != null && videoDurationSec > 0;
   const isLongVideo =
     durationReady &&
     effectiveDurationSec != null &&
@@ -1352,7 +1277,6 @@ export default function HomePage() {
   }, []);
 
   const handleUploadVideoClick = useCallback(async () => {
-    if (videoSourceMode !== "file") return;
     if (!file || !authLoaded || !isSignedIn) return;
     const durationReady =
       videoDurationSec != null && videoDurationSec > 0;
@@ -1409,7 +1333,6 @@ export default function HomePage() {
     }
     setUploadTrigger((n) => n + 1);
   }, [
-    videoSourceMode,
     file,
     authLoaded,
     isSignedIn,
@@ -1466,8 +1389,7 @@ export default function HomePage() {
   };
 
   const handleGenerate = async () => {
-    if (videoSourceMode === "file" && !file) return;
-    if (videoSourceMode === "youtube" && !youtubeUrl.trim()) return;
+    if (!file) return;
     if (!authLoaded) {
       setError("Loading your account — try again in a moment.");
       return;
@@ -1485,9 +1407,7 @@ export default function HomePage() {
     }
     if (!durationReady) {
       setError(
-        videoSourceMode === "youtube"
-          ? "Still loading video info — wait a moment or check the link."
-          : "Still reading video length — wait a moment, or try another file."
+        "Still reading video length — wait a moment, or try another file."
       );
       return;
     }
@@ -1523,32 +1443,22 @@ export default function HomePage() {
         setStatusIdx(-1);
         setUploadProgress(null);
 
-        const uploadForJob =
-          videoSourceMode === "file"
-            ? ((clientTrimmedFile ?? file) as File)
-            : null;
-        const fileKey =
-          uploadForJob != null ? fileKeyFromFile(uploadForJob) : "";
+        const uploadForJob = (clientTrimmedFile ?? file) as File;
+        const fileKey = fileKeyFromFile(uploadForJob);
         const snap0 = preflightSnapshotRef.current;
         const fastR2 =
-          videoSourceMode === "file" &&
           (snap0.kind === "r2_put_done" || snap0.kind === "running") &&
           snap0.fileKey === fileKey &&
           snap0.platform === platform &&
           snap0.goal === goal;
 
         const fastMultipart =
-          videoSourceMode === "file" &&
           snap0.kind === "multipart_only" &&
           snap0.fileKey === fileKey &&
           snap0.platform === platform &&
           snap0.goal === goal;
 
-        if (
-          videoSourceMode === "file" &&
-          !fastR2 &&
-          !fastMultipart
-        ) {
+        if (!fastR2 && !fastMultipart) {
           preflightRunIdRef.current += 1;
           preflightPutXhrRef.current?.abort();
           preflightPutXhrRef.current = null;
@@ -1652,10 +1562,6 @@ export default function HomePage() {
               redirectToSignIn({ redirectUrl: window.location.href });
               return false;
             }
-            if (parsed.code === YOUTUBE_AUTH_REQUIRED_CODE) {
-              setError(errText || YOUTUBE_AUTH_FRIENDLY_MESSAGE);
-              return false;
-            }
             if (
               status === 400 &&
               parsed.longVideoSegmentRequired === true
@@ -1695,124 +1601,7 @@ export default function HomePage() {
 
         let jobIdForPoll: string;
 
-        if (videoSourceMode === "youtube") {
-          const postInitYt = () =>
-            fetch("/api/process/init", {
-              method: "POST",
-              credentials: "include",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ platform, goal }),
-            });
-
-          let initResYt = await postInitYt();
-          if (initResYt.status === 401) {
-            sessionOk = await refreshClerkSessionForUpload(getToken);
-            if (sessionOk) {
-              initResYt = await postInitYt();
-            }
-          }
-          if (initResYt.status === 401) {
-            setIsCreatingJob(false);
-            setError(SESSION_EXPIRED_COPY);
-            redirectToSignIn({ redirectUrl: window.location.href });
-            return;
-          }
-
-          const initRawYt = await initResYt.text();
-          let initParsedYt: Record<string, unknown>;
-          try {
-            initParsedYt = JSON.parse(initRawYt) as Record<string, unknown>;
-          } catch {
-            setIsCreatingJob(false);
-            throw new Error(
-              messageForFailedProcessResponse(initResYt, initRawYt, true)
-            );
-          }
-
-          if (!initResYt.ok) {
-            setIsCreatingJob(false);
-            const errText =
-              typeof initParsedYt.error === "string" && initParsedYt.error
-                ? initParsedYt.error
-                : messageForFailedProcessResponse(initResYt, initRawYt);
-            if (initResYt.status === 401 || /unauthorized/i.test(errText)) {
-              setError(SESSION_EXPIRED_COPY);
-              redirectToSignIn({ redirectUrl: window.location.href });
-              return;
-            }
-            throw new Error(errText);
-          }
-
-          if (initResYt.status !== 202) {
-            setIsCreatingJob(false);
-            throw new Error(
-              "Unexpected response from server. Try again or update the app."
-            );
-          }
-
-          const jobIdYt =
-            typeof initParsedYt.jobId === "string" ? initParsedYt.jobId : "";
-          if (!jobIdYt) {
-            setIsCreatingJob(false);
-            throw new Error("Server did not return a job id.");
-          }
-
-          logUiE2e("init_response_received", uiE2eT0, jobIdYt);
-
-          uploadStartMsRef.current = 0;
-          setUploadProgress({
-            loaded: 0,
-            total: 100,
-            percent: 0,
-            etaSec: null,
-          });
-          logUiE2e("youtube_ingest_started", uiE2eT0, jobIdYt);
-
-          const postYoutubeIngest = () =>
-            fetch("/api/process/youtube-ingest", {
-              method: "POST",
-              credentials: "include",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                jobId: jobIdYt,
-                youtubeUrl: youtubeUrl.trim(),
-                longVideoSegment:
-                  isLongVideo && longVideoSegment
-                    ? longVideoSegment
-                    : undefined,
-              }),
-            });
-
-          let ingestRes = await postYoutubeIngest();
-          if (ingestRes.status === 401) {
-            sessionOk = await refreshClerkSessionForUpload(getToken);
-            if (sessionOk) {
-              ingestRes = await postYoutubeIngest();
-            }
-          }
-          if (ingestRes.status === 401) {
-            setUploadProgress(null);
-            setIsCreatingJob(false);
-            setError(SESSION_EXPIRED_COPY);
-            redirectToSignIn({ redirectUrl: window.location.href });
-            return;
-          }
-
-          const ingestRaw = await ingestRes.text();
-          if (
-            !(await finalizeUploadResponse(
-              ingestRaw,
-              ingestRes.status,
-              jobIdYt
-            ))
-          ) {
-            setIsCreatingJob(false);
-            return;
-          }
-          setUploadProgress(null);
-          setIsCreatingJob(false);
-          jobIdForPoll = jobIdYt;
-        } else if (fastR2) {
+        if (fastR2) {
           const jobId =
             snap0.kind === "running" || snap0.kind === "r2_put_done"
               ? snap0.jobId
@@ -2277,7 +2066,7 @@ export default function HomePage() {
   /** After preflight succeeds, start the same generate flow as the primary button (no extra click). */
   useEffect(() => {
     if (!preflightReadyHint || preflightUploadActive) return;
-    if (videoSourceMode !== "file" || !file || result) return;
+    if (!file || result) return;
     if (!authLoaded || !isSignedIn) return;
     if (usage != null && usage.minutesRemaining <= 0) return;
     if (preflightTerminalFailed) return;
@@ -2289,7 +2078,6 @@ export default function HomePage() {
   }, [
     preflightReadyHint,
     preflightUploadActive,
-    videoSourceMode,
     file,
     result,
     authLoaded,
@@ -2304,14 +2092,12 @@ export default function HomePage() {
   const isProcessing =
     !error &&
     (isCreatingJob ||
-      (videoSourceMode === "file" && preflightUploadActive) ||
-      (uploadProgress !== null &&
-        (videoSourceMode === "file" ? !preflightUploadActive : true)) ||
+      preflightUploadActive ||
+      (uploadProgress !== null && !preflightUploadActive) ||
       (statusIdx >= 0 && statusIdx < STATUS_STEPS.length - 1));
 
   /** User tapped Upload Video; waiting for preflight to begin or finish (narrow gap before `preflightUploadActive`). */
   const mustWaitForPreflightGate =
-    videoSourceMode === "file" &&
     !!file &&
     isSignedIn &&
     authLoaded &&
@@ -2321,30 +2107,23 @@ export default function HomePage() {
     !preflightTerminalFailed;
 
   const generateDisabled =
-    (videoSourceMode === "file" && !file) ||
-    (videoSourceMode === "youtube" && !youtubeUrl.trim()) ||
+    !file ||
     isProcessing ||
     clientTrimBusy ||
     (usage != null && usage.minutesRemaining <= 0) ||
-    (videoSourceMode === "file" && mustWaitForPreflightGate) ||
-    (videoSourceMode === "file" && file && !isSignedIn) ||
-    (videoSourceMode === "file" && file && !authLoaded) ||
-    (videoSourceMode === "file" && file && !uploadPrereqsMet) ||
-    (videoSourceMode === "youtube" &&
-      (!uploadPrereqsMet ||
-        youtubeMetaError !== null ||
-        youtubeMetaLoading));
+    mustWaitForPreflightGate ||
+    (file && !isSignedIn) ||
+    (file && !authLoaded) ||
+    (file && !uploadPrereqsMet);
 
   /** Brief idle state after preflight before auto-start runs — keep CTA muted (no misleading primary). */
   const autoClipStartPending =
-    videoSourceMode === "file" &&
     preflightReadyHint &&
     !preflightUploadActive &&
     !error &&
     !isProcessing;
 
   const showPrimaryUploadCta =
-    videoSourceMode === "file" &&
     !!file &&
     isSignedIn &&
     authLoaded &&
@@ -2356,7 +2135,6 @@ export default function HomePage() {
     (uploadTrigger === 0 || preflightTerminalFailed);
 
   const showPrimaryGenerateCta =
-    videoSourceMode === "file" &&
     !generateDisabled &&
     preflightReadyHint &&
     !preflightTerminalFailed &&
@@ -2365,42 +2143,16 @@ export default function HomePage() {
 
   /** Bright retry after a failed auto-generation (upload already succeeded). */
   const showPrimaryGenRetryCta =
-    videoSourceMode === "file" &&
     !generateDisabled &&
     preflightReadyHint &&
     !preflightTerminalFailed &&
     !!error &&
     !isProcessing;
 
-  const showPrimaryYoutubeCta =
-    videoSourceMode === "youtube" &&
-    isSignedIn &&
-    authLoaded &&
-    (usage == null || usage.minutesRemaining > 0) &&
-    uploadPrereqsMet &&
-    youtubeMetaError === null &&
-    !youtubeMetaLoading &&
-    !isProcessing &&
-    !error &&
-    !clientTrimBusy;
-
-  const showPrimaryYoutubeRetryCta =
-    videoSourceMode === "youtube" &&
-    isSignedIn &&
-    authLoaded &&
-    (usage == null || usage.minutesRemaining > 0) &&
-    uploadPrereqsMet &&
-    youtubeMetaError === null &&
-    !isProcessing &&
-    !!error &&
-    !clientTrimBusy;
-
   const showPrimaryCta =
     showPrimaryUploadCta ||
     showPrimaryGenerateCta ||
-    showPrimaryGenRetryCta ||
-    showPrimaryYoutubeCta ||
-    showPrimaryYoutubeRetryCta;
+    showPrimaryGenRetryCta;
 
   const uploadPhaseButtonLabel =
     uploadTrigger > 0 &&
@@ -2409,35 +2161,7 @@ export default function HomePage() {
     (preflightUploadActive || mustWaitForPreflightGate);
 
   let generateButtonLabel = "Upload Video";
-  if (videoSourceMode === "youtube") {
-    if (!youtubeUrl.trim()) {
-      generateButtonLabel = "Paste a YouTube link";
-    } else if (!authLoaded) {
-      generateButtonLabel = "Loading account...";
-    } else if (!isSignedIn) {
-      generateButtonLabel = "Sign in to generate";
-    } else if (usage != null && usage.minutesRemaining <= 0) {
-      generateButtonLabel = "No minutes remaining";
-    } else if (youtubeMetaLoading) {
-      generateButtonLabel = "Reading video info…";
-    } else if (youtubeMetaError) {
-      generateButtonLabel = "Check the link";
-    } else if (!durationReady) {
-      generateButtonLabel = "Reading video…";
-    } else if (isLongVideo && !longVideoSegment) {
-      generateButtonLabel = "Choose a 60-minute section";
-    } else if (isProcessing) {
-      if (uploadProgress || isCreatingJob) {
-        generateButtonLabel = "Downloading from YouTube…";
-      } else {
-        generateButtonLabel = "Processing...";
-      }
-    } else if (error && !isProcessing) {
-      generateButtonLabel = "Generate Clips";
-    } else {
-      generateButtonLabel = "Generate Clips";
-    }
-  } else if (!file) {
+  if (!file) {
     generateButtonLabel = "Choose a video first";
   } else if (!authLoaded) {
     generateButtonLabel = "Loading account...";
@@ -2552,10 +2276,6 @@ export default function HomePage() {
                 onClick={() => {
                   setResult(null);
                   setFile(null);
-                  setVideoSourceMode("file");
-                  setYoutubeUrl("");
-                  setYoutubeDurationSec(null);
-                  setYoutubeMetaError(null);
                   setStatus(null);
                   setStatusIdx(-1);
                   setOpenEditClipIndex(null);
@@ -2917,55 +2637,6 @@ export default function HomePage() {
 
               {/* Upload + Settings */}
               <div className="max-w-2xl mx-auto space-y-6 text-left">
-                <div className="flex rounded-xl border border-gray-700 overflow-hidden bg-gray-900/50 p-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setVideoSourceMode("file");
-                      setYoutubeUrl("");
-                      setYoutubeDurationSec(null);
-                      setYoutubeMetaError(null);
-                    }}
-                    className={`flex-1 py-2.5 text-sm font-medium rounded-lg transition-colors ${
-                      videoSourceMode === "file"
-                        ? "bg-purple-600/30 text-white border border-purple-500/40"
-                        : "text-gray-400 hover:text-gray-200"
-                    }`}
-                  >
-                    Upload file
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setVideoSourceMode("youtube");
-                      setFile(null);
-                      setUploadTrigger(0);
-                      setLongVideoSegment(null);
-                      setClientTrimmedFile(null);
-                      preflightRunIdRef.current += 1;
-                      preflightPutXhrRef.current?.abort();
-                      preflightPutXhrRef.current = null;
-                      preflightMultipartAbortRef.current?.abort();
-                      preflightMultipartAbortRef.current = null;
-                      preflightPutPromiseRef.current = null;
-                      preflightSnapshotRef.current = { kind: "none" };
-                      setPreflightUploadActive(false);
-                      setPreflightReadyHint(false);
-                      setPreflightTerminalFailed(false);
-                      setUploadProgress(null);
-                      if (inputRef.current) inputRef.current.value = "";
-                    }}
-                    className={`flex-1 py-2.5 text-sm font-medium rounded-lg transition-colors ${
-                      videoSourceMode === "youtube"
-                        ? "bg-purple-600/30 text-white border border-purple-500/40"
-                        : "text-gray-400 hover:text-gray-200"
-                    }`}
-                  >
-                    YouTube link
-                  </button>
-                </div>
-
-                {videoSourceMode === "file" ? (
                 <div
                   onDragOver={(e) => {
                     e.preventDefault();
@@ -3014,38 +2685,6 @@ export default function HomePage() {
                     </div>
                   )}
                 </div>
-                ) : (
-                <div className="border border-gray-700 rounded-2xl p-6 bg-gray-900/50 space-y-3 text-left">
-                  <label className="block text-sm text-gray-400" htmlFor="youtube-url-input">
-                    YouTube URL
-                  </label>
-                  <input
-                    id="youtube-url-input"
-                    type="url"
-                    value={youtubeUrl}
-                    onChange={(e) => {
-                      setYoutubeUrl(e.target.value);
-                      setLongVideoSegment(null);
-                    }}
-                    placeholder="https://www.youtube.com/watch?v=…"
-                    className="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-white placeholder:text-gray-600 focus:outline-none focus:border-purple-500"
-                  />
-                  {youtubeMetaLoading && (
-                    <p className="text-xs text-gray-500">Loading video info…</p>
-                  )}
-                  {youtubeMetaError && (
-                    <p className="text-xs text-red-400">{youtubeMetaError}</p>
-                  )}
-                  {youtubeDurationSec != null && !youtubeMetaError && !youtubeMetaLoading && (
-                    <p className="text-xs text-gray-500">
-                      Duration {fmtTime(youtubeDurationSec)}
-                    </p>
-                  )}
-                  <p className="text-[11px] text-gray-600 leading-relaxed">
-                    Use videos you have the right to process. The server downloads the file with yt-dlp (no YouTube API key).
-                  </p>
-                </div>
-                )}
 
                 {/* Platform, goal, plan + recommended clip settings (single card) */}
                 <div className="bg-gray-900/60 border border-gray-800 rounded-xl p-4 space-y-4">
@@ -3250,10 +2889,6 @@ export default function HomePage() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (videoSourceMode === "youtube") {
-                      void handleGenerate();
-                      return;
-                    }
                     if (preflightReadyHint && error && !isProcessing) {
                       void handleGenerate();
                       return;
