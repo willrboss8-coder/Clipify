@@ -27,5 +27,7 @@ export function isYoutubeDlpAuthLikeFailure(combinedStd: string): boolean {
   if (t.includes("sign in to confirm your age")) return true;
   if (t.includes("please sign in") && t.includes("not a bot")) return true;
   if (t.includes("cookies") && t.includes("authentication")) return true;
+  if (t.includes("po_token") && t.includes("cookies")) return true;
+  if (t.includes("login required") || t.includes("log in to confirm")) return true;
   return false;
 }

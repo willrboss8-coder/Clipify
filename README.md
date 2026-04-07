@@ -26,6 +26,8 @@ Paste links use **yt-dlp** on the server only (no YouTube Data API). YouTube som
 
 Optionally set **`YT_DLP_COOKIES_FILE`** to an absolute path of a **Netscape-format cookies file** (e.g. exported for use with `yt-dlp`). That file is read **only on the server** by `yt-dlp` for metadata and download—not by the browser and not by user accounts in the app. If the variable is unset, behavior matches the previous release (no cookies). If the path is set but the file is missing, cookies are skipped and a warning is logged.
 
+Metadata and download **retry** with several YouTube `player_client` chains (datacenter IPs often fail on the default web client). When cookies are present, `tv_downgraded,web_safari` is tried first. To force one strategy, set **`YT_DLP_YOUTUBE_EXTRACTOR_ARGS`** to a full string such as `youtube:player_client=tv_downgraded,web_safari` (or omit the `youtube:` prefix; it will be added). Keep **`yt-dlp` current** (`pip install -U yt-dlp` or redeploy after bumping `requirements.txt`).
+
 ### Premium viral captions (optional word-level timing)
 
 By default, viral caption **timing** uses the existing local **SRT** from the job. For **better sync**, set:
